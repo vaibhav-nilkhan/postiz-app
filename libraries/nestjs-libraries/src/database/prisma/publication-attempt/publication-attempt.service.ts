@@ -19,7 +19,7 @@ export type TemporalAttemptIdentity = {
   attempt: number;
 };
 
-export type CorrelatedPost = {
+export type PublicationRequestPost = {
   postId: string;
   integration: string;
 };
@@ -48,13 +48,13 @@ const PROVIDER_REPORTED_SUCCESS = new Set([
 ]);
 const PROVIDER_REPORTED_FAILURE = new Set(['error', 'failed', 'rejected']);
 
-function correlatedPosts(request: {
+function publicationRequestPosts(request: {
   bindings: Array<{
     rootPostId: string;
     integrationId: string;
     position: number;
   }>;
-}): CorrelatedPost[] {
+}): PublicationRequestPost[] {
   return [...request.bindings]
     .sort((a, b) => a.position - b.position)
     .map((binding) => ({
@@ -77,13 +77,13 @@ export class PublicationAttemptService {
 
   async resolvePublicationRequest(
     organizationId: string,
-    correlationId: string,
+    idempotencyKey: string,
     requestHash: string,
     database: PublicationDatabase = this._prisma
-  ): Promise<CorrelatedPost[] | null> {
+  ): Promise<PublicationRequestPost[] | null> {
     const existing = await database.publicationRequest.findUnique({
       where: {
-        organizationId_correlationId: { organizationId, correlationId },
+        organizationId_idempotencyKey: { organizationId, idempotencyKey },
       },
       include: { bindings: true },
     });
@@ -94,20 +94,20 @@ export class PublicationAttemptService {
 
     if (existing.requestHash !== requestHash) {
       throw new ConflictException(
-        'X-Postify-Correlation-Id was already used for a different request'
+        'Idempotency-Key was already used for a different request'
       );
     }
 
-    return correlatedPosts(existing);
+    return publicationRequestPosts(existing);
   }
 
   async createPublicationRequest(
     database: Prisma.TransactionClient,
     input: {
       organizationId: string;
-      correlationId: string;
+      idempotencyKey: string;
       requestHash: string;
-      posts: CorrelatedPost[];
+      posts: PublicationRequestPost[];
     }
   ): Promise<void> {
     const integrations = await database.integration.findMany({
@@ -123,14 +123,14 @@ export class PublicationAttemptService {
 
     if (input.posts.some((post) => !integrationById.has(post.integration))) {
       throw new ConflictException(
-        'A correlated post references an integration outside the organization'
+        'A publication request references an integration outside the organization'
       );
     }
 
     await database.publicationRequest.create({
       data: {
         organizationId: input.organizationId,
-        correlationId: input.correlationId,
+        idempotencyKey: input.idempotencyKey,
         requestHash: input.requestHash,
         bindings: {
           create: input.posts.map((post, position) => ({
@@ -319,8 +319,8 @@ export class PublicationAttemptService {
       );
     }
 
-    // Validate the key before opening the transaction. A correlated post must
-    // never reach the provider without signed durable evidence.
+    // Validate the signing key before opening the transaction. A publication
+    // request must never reach the provider without signed durable evidence.
     signEvidenceHash('preflight', this.signingKey());
     const operationKey = this.operationKey(
       binding.id,
@@ -373,7 +373,7 @@ export class PublicationAttemptService {
         const createdAt = new Date();
         const immutableEvidence = {
           publicationRequestId: binding.publicationRequestId,
-          correlationId: binding.publicationRequest.correlationId,
+          idempotencyKey: binding.publicationRequest.idempotencyKey,
           organizationId: input.integration.organizationId,
           customerId: binding.customerId || null,
           rootPostId,
@@ -677,7 +677,7 @@ export class PublicationAttemptService {
     });
   }
 
-  async isCorrelatedPost(rootPostId: string): Promise<boolean> {
+  async isPublicationRequestPost(rootPostId: string): Promise<boolean> {
     return !!(await this._prisma.publicationRequestBinding.findUnique({
       where: { rootPostId },
       select: { id: true },

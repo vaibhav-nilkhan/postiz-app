@@ -190,7 +190,7 @@ export class PublicIntegrationsController {
   async createPost(
     @GetOrgFromRequest() org: Organization,
     @Body() rawBody: any,
-    @Headers('x-postify-correlation-id') postifyCorrelationId?: string
+    @Headers('idempotency-key') idempotencyKey?: string
   ) {
     Sentry.metrics.count('public_api-request', 1);
     const body = await this._postsService.mapTypeToPost(
@@ -263,21 +263,21 @@ export class PublicIntegrationsController {
       ? (rawBody.creationMethod as 'CLI' | 'API')
       : 'API';
 
-    const correlationId = postifyCorrelationId?.trim();
+    const normalizedIdempotencyKey = idempotencyKey?.trim();
     if (
-      correlationId &&
-      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(correlationId)
+      normalizedIdempotencyKey &&
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(normalizedIdempotencyKey)
     ) {
-      throw new HttpException({ msg: 'Invalid X-Postify-Correlation-Id' }, 400);
+      throw new HttpException({ msg: 'Invalid Idempotency-Key' }, 400);
     }
 
     return this._postsService.createPost(
       org.id,
       body,
       creationMethod,
-      correlationId
+      normalizedIdempotencyKey
         ? {
-            correlationId,
+            idempotencyKey: normalizedIdempotencyKey,
             requestHash: canonicalSha256({ body, creationMethod }),
           }
         : undefined

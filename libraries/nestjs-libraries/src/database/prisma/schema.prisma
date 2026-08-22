@@ -458,13 +458,13 @@ model Post {
 model PublicationRequest {
   id             String                      @id @default(uuid())
   organizationId String
-  correlationId  String
+  idempotencyKey String
   requestHash    String
   createdAt      DateTime                    @default(now())
   organization   Organization                @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   bindings       PublicationRequestBinding[]
 
-  @@unique([organizationId, correlationId])
+  @@unique([organizationId, idempotencyKey])
   @@index([createdAt])
 }
 
@@ -529,7 +529,7 @@ model PublicationAttempt {
 
 // Immutable append-only claims. terminalAttemptId permits only one terminal
 // claim per attempt; operationKey permits only one success/unknown effect per
-// correlated root mutation while explicit failures remain retryable.
+// request-bound root mutation while explicit failures remain retryable.
 model PublicationAttemptEvent {
   id                   String                      @id @default(uuid())
   publicationAttemptId String
