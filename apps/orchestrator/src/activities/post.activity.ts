@@ -558,6 +558,22 @@ export class PostActivity {
   async changeState(id: string, state: State, err?: any, body?: any) {
     const publicationRequestBound =
       await this._publicationAttemptService.isPublicationRequestPost(id);
+    if (publicationRequestBound && state === State.PUBLISHED) {
+      const identity = this.activityIdentity();
+      if (
+        await this._publicationAttemptService.hasProviderReportedSuccess(
+          id,
+          identity
+        )
+      ) {
+        return;
+      }
+      throw new ApplicationFailure(
+        'Request-bound posts require durable provider success evidence before PUBLISHED',
+        'publication_evidence_required',
+        true
+      );
+    }
     const identity =
       state === State.ERROR ? this.activityIdentity() : undefined;
     if (identity) {

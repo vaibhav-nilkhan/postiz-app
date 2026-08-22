@@ -469,6 +469,110 @@ describe('PublicationAttemptService', () => {
     );
   });
 
+  it.each([
+    {
+      name: 'mixed pending and success statuses',
+      captionEvidence: [{ postId: 'post-1' }, { postId: 'post-2' }],
+      rawResults: [
+        {
+          id: 'post-1',
+          postId: '',
+          releaseURL: '',
+          status: 'pending',
+        },
+        {
+          id: 'post-2',
+          postId: 'platform-2',
+          releaseURL: 'https://platform.test/2',
+          status: 'success',
+        },
+      ],
+    },
+    {
+      name: 'a non-string status',
+      captionEvidence: [{ postId: 'post-1' }],
+      rawResults: [
+        {
+          id: 'post-1',
+          postId: 'platform-1',
+          releaseURL: 'https://platform.test/1',
+          status: { toString: () => 'success' },
+        },
+      ],
+    },
+  ])('records $name as unknown', async (testCase) => {
+    const database = databaseDouble();
+    database.publicationAttempt.findUniqueOrThrow.mockResolvedValue({
+      ...attempt,
+      captionEvidence: testCase.captionEvidence,
+    });
+    database.publicationAttemptEvent.findFirst.mockResolvedValue(null);
+    database.publicationAttemptEvent.create.mockResolvedValue({
+      id: 'event-1',
+    });
+    database.post.update.mockResolvedValue({ id: 'post-1' });
+    const service = new PublicationAttemptService(database as never);
+
+    await expect(
+      service.recordProviderResult('attempt-1', testCase.rawResults as never)
+    ).resolves.toBe('unknown');
+
+    expect(database.publicationAttemptEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          type: PublicationAttemptEventType.UNKNOWN,
+          reason: 'unrecognized-or-mixed-provider-result',
+        }),
+      })
+    );
+    expect(database.post.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ state: 'PUBLISHED' }),
+      })
+    );
+  });
+
+  it.each([
+    { name: 'non-string release id', postId: { provider: 'platform-1' } },
+    { name: 'non-string release URL', releaseURL: 123 },
+    { name: 'non-HTTP release URL', releaseURL: 'ftp://platform.test/1' },
+  ])('records $name as unknown', async (overrides) => {
+    const database = databaseDouble();
+    database.publicationAttempt.findUniqueOrThrow.mockResolvedValue(attempt);
+    database.publicationAttemptEvent.findFirst.mockResolvedValue(null);
+    database.publicationAttemptEvent.create.mockResolvedValue({
+      id: 'event-1',
+    });
+    database.post.update.mockResolvedValue({ id: 'post-1' });
+    const service = new PublicationAttemptService(database as never);
+
+    await expect(
+      service.recordProviderResult('attempt-1', [
+        {
+          id: 'post-1',
+          postId: 'platform-1',
+          releaseURL: 'https://platform.test/1',
+          status: 'success',
+          ...overrides,
+        } as never,
+      ])
+    ).resolves.toBe('unknown');
+
+    expect(database.publicationAttemptEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          type: PublicationAttemptEventType.UNKNOWN,
+          reason: 'incomplete-provider-success-result',
+        }),
+      })
+    );
+    expect(database.post.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ state: 'PUBLISHED' }),
+      })
+    );
+  });
+
   it('records an incomplete provider success as unknown instead of published', async () => {
     const database = databaseDouble();
     database.publicationAttempt.findUniqueOrThrow.mockResolvedValue(attempt);
@@ -500,6 +604,31 @@ describe('PublicationAttemptService', () => {
     expect(database.post.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ state: 'ERROR' }),
+      })
+    );
+  });
+
+  it('rejects malformed workflow completion without durable success', async () => {
+    const database = databaseDouble();
+    database.publicationAttempt.findFirst.mockResolvedValue(attempt);
+    database.publicationAttempt.findUniqueOrThrow.mockResolvedValue(attempt);
+    database.publicationAttemptEvent.findFirst.mockResolvedValue(null);
+    database.publicationAttemptEvent.create.mockResolvedValue({
+      id: 'event-1',
+    });
+    database.post.update.mockResolvedValue({ id: 'post-1' });
+    const service = new PublicationAttemptService(database as never);
+
+    await expect(
+      service.completeFromWorkflow('post-1', 'platform-1', 'not-an-http-url', {
+        workflowId: 'workflow-1',
+        runId: 'run-1',
+      })
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(database.post.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ state: 'PUBLISHED' }),
       })
     );
   });
