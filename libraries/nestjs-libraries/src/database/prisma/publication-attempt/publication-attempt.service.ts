@@ -481,9 +481,17 @@ export class PublicationAttemptService {
     }
 
     const statuses = rawResults.map((result) =>
-      String(result.status || '').toLowerCase()
+      typeof result.status === 'string' ? result.status.toLowerCase() : null
     );
-    if (statuses.every((status) => PROVIDER_REPORTED_FAILURE.has(status))) {
+    const allExplicitFailures = statuses.every(
+      (status) => status !== null && PROVIDER_REPORTED_FAILURE.has(status)
+    );
+    const allPending = statuses.every((status) => status === 'pending');
+    const allRecognizedSuccess = statuses.every(
+      (status) => status !== null && PROVIDER_REPORTED_SUCCESS.has(status)
+    );
+
+    if (allExplicitFailures) {
       await this.recordProviderFailure(
         attemptId,
         PublicationAttemptEventType.EXPLICIT_FAILURE,
@@ -492,12 +500,7 @@ export class PublicationAttemptService {
       );
       return 'explicit-failure';
     }
-    if (
-      statuses.some(
-        (status) =>
-          status !== 'pending' && !PROVIDER_REPORTED_SUCCESS.has(status)
-      )
-    ) {
+    if (!allPending && !allRecognizedSuccess) {
       await this.recordProviderFailure(
         attemptId,
         PublicationAttemptEventType.UNKNOWN,
@@ -509,15 +512,29 @@ export class PublicationAttemptService {
 
     const results = normalizeProviderResult(rawResults);
     if (
-      results.every(
-        (result) => result.status === 'provider-reported-success'
-      ) &&
-      results.some(
-        (result) =>
-          !result.platformReleaseId ||
-          !result.platformReleaseUrl ||
-          !result.postId
-      )
+      allRecognizedSuccess &&
+      (rawResults.some((result) => {
+        if (
+          typeof result.postId !== 'string' ||
+          !result.postId.trim() ||
+          typeof result.releaseURL !== 'string' ||
+          !result.releaseURL.trim()
+        ) {
+          return true;
+        }
+        try {
+          const releaseUrl = new URL(result.releaseURL);
+          return !['http:', 'https:'].includes(releaseUrl.protocol);
+        } catch {
+          return true;
+        }
+      }) ||
+        results.some(
+          (result) =>
+            !result.platformReleaseId ||
+            !result.platformReleaseUrl ||
+            !result.postId
+        ))
     ) {
       await this.recordProviderFailure(
         attemptId,
@@ -529,14 +546,12 @@ export class PublicationAttemptService {
     }
 
     const resultEvidence = {
-      claim: results.some((result) => result.status === 'provider-accepted')
-        ? 'provider-accepted'
-        : 'provider-reported-success',
+      claim: allPending ? 'provider-accepted' : 'provider-reported-success',
       independentlyPlatformVerified: false,
       results,
     };
 
-    if (results.some((result) => result.status === 'provider-accepted')) {
+    if (allPending) {
       return this._prisma.$transaction(async (database) => {
         const attempt = await database.publicationAttempt.findUniqueOrThrow({
           where: { id: attemptId },
@@ -628,7 +643,7 @@ export class PublicationAttemptService {
       return false;
     }
 
-    await this.recordProviderResult(attempt.id, [
+    const outcome = await this.recordProviderResult(attempt.id, [
       {
         id: postId,
         postId: platformReleaseId,
@@ -636,6 +651,11 @@ export class PublicationAttemptService {
         status: 'success',
       },
     ]);
+    if (outcome !== 'success') {
+      throw new ConflictException(
+        'Workflow completion did not produce durable provider success evidence'
+      );
+    }
     return true;
   }
 

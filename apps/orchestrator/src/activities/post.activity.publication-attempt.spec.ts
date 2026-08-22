@@ -102,4 +102,41 @@ describe('PostActivity publication evidence boundary', () => {
 
     expect(postService.changeState).not.toHaveBeenCalled();
   });
+
+  it('rejects evidence-free PUBLISHED for a request-bound post', async () => {
+    vi.spyOn(Context, 'current').mockReturnValue({
+      info: {
+        workflowExecution: { workflowId: 'workflow-1', runId: 'run-1' },
+        activityId: 'change-state-1',
+        activityType: 'changeState',
+        attempt: 1,
+      },
+    } as never);
+    const postService = { changeState: vi.fn() };
+    const publicationAttemptService = {
+      isPublicationRequestPost: vi.fn().mockResolvedValue(true),
+      markOpenAttemptTerminal: vi.fn(),
+      hasProviderReportedSuccess: vi.fn().mockResolvedValue(false),
+    };
+    const activity = new PostActivity(
+      postService as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      publicationAttemptService as never
+    );
+
+    await expect(activity.changeState('post-1', 'PUBLISHED')).rejects.toThrow(
+      'durable provider success evidence'
+    );
+
+    expect(postService.changeState).not.toHaveBeenCalled();
+    expect(
+      publicationAttemptService.markOpenAttemptTerminal
+    ).not.toHaveBeenCalled();
+  });
 });
