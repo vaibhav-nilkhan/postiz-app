@@ -556,9 +556,8 @@ export class PostActivity {
 
   @ActivityMethod()
   async changeState(id: string, state: State, err?: any, body?: any) {
-    const correlated = await this._publicationAttemptService.isCorrelatedPost(
-      id
-    );
+    const publicationRequestBound =
+      await this._publicationAttemptService.isPublicationRequestPost(id);
     const identity =
       state === State.ERROR ? this.activityIdentity() : undefined;
     if (identity) {
@@ -574,7 +573,7 @@ export class PostActivity {
           : 'workflow-could-not-confirm-provider-outcome'
       );
     }
-    if (correlated) {
+    if (publicationRequestBound) {
       if (
         identity &&
         (await this._publicationAttemptService.hasProviderReportedSuccess(

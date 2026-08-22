@@ -67,8 +67,8 @@ type PostWithConditionals = Post & {
   childrenPost: Post[];
 };
 
-export type PublicationCorrelation = {
-  correlationId: string;
+export type PublicationIdempotency = {
+  idempotencyKey: string;
   requestHash: string;
 };
 
@@ -925,19 +925,19 @@ export class PostsService {
     body: CreatePostDto,
     creationMethod: CreationMethod,
     keepGroup = false,
-    publicationCorrelation?: PublicationCorrelation
+    publicationIdempotency?: PublicationIdempotency
   ): Promise<any[]> {
-    if (publicationCorrelation && body.inter) {
+    if (publicationIdempotency && body.inter) {
       throw new BadRequestException(
-        'X-Postify-Correlation-Id cannot be used with repeating posts'
+        'Idempotency-Key cannot be used with repeating posts'
       );
     }
-    if (publicationCorrelation) {
+    if (publicationIdempotency) {
       const existing =
         await this._publicationAttemptService.resolvePublicationRequest(
           orgId,
-          publicationCorrelation.correlationId,
-          publicationCorrelation.requestHash
+          publicationIdempotency.idempotencyKey,
+          publicationIdempotency.requestHash
         );
       if (existing) {
         return existing;
@@ -1026,7 +1026,7 @@ export class PostsService {
       Sentry.metrics.count('post_created', 1);
     };
 
-    if (publicationCorrelation) {
+    if (publicationIdempotency) {
       try {
         const persisted = await this._prisma.$transaction(
           async (database) => {
@@ -1035,8 +1035,8 @@ export class PostsService {
             const existing =
               await this._publicationAttemptService.resolvePublicationRequest(
                 orgId,
-                publicationCorrelation.correlationId,
-                publicationCorrelation.requestHash,
+                publicationIdempotency.idempotencyKey,
+                publicationIdempotency.requestHash,
                 database
               );
             if (existing) {
@@ -1047,7 +1047,7 @@ export class PostsService {
             for (const post of preparedPosts) {
               const saved = await persistPost(post, database);
               if (!saved) {
-                throw new Error('Failed to persist correlated post');
+                throw new Error('Failed to persist publication request post');
               }
               posts.push(saved);
             }
@@ -1056,8 +1056,8 @@ export class PostsService {
               database,
               {
                 organizationId: orgId,
-                correlationId: publicationCorrelation.correlationId,
-                requestHash: publicationCorrelation.requestHash,
+                idempotencyKey: publicationIdempotency.idempotencyKey,
+                requestHash: publicationIdempotency.requestHash,
                 posts,
               }
             );
@@ -1078,20 +1078,20 @@ export class PostsService {
           throw error;
         }
 
-        // The unique organization/correlation constraint selects one winner.
+        // The unique organization/idempotency-key constraint selects one winner.
         // Its request hash still has to match before this becomes an idempotent
         // replay rather than a conflict.
         const existing =
           await this._publicationAttemptService.resolvePublicationRequest(
             orgId,
-            publicationCorrelation.correlationId,
-            publicationCorrelation.requestHash
+            publicationIdempotency.idempotencyKey,
+            publicationIdempotency.requestHash
           );
         if (existing) {
           return existing;
         }
         throw new ConflictException(
-          'A root post in this request is already bound to another correlation identity'
+          'A root post in this request is already bound to another idempotency key'
         );
       }
     }

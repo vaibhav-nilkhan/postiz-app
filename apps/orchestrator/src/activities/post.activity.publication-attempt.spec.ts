@@ -78,7 +78,7 @@ describe('PostActivity publication evidence boundary', () => {
     } as never);
     const postService = { changeState: vi.fn() };
     const publicationAttemptService = {
-      isCorrelatedPost: vi.fn().mockResolvedValue(true),
+      isPublicationRequestPost: vi.fn().mockResolvedValue(true),
       markOpenAttemptTerminal: vi.fn().mockResolvedValue(false),
       hasProviderReportedSuccess: vi.fn().mockResolvedValue(true),
     };

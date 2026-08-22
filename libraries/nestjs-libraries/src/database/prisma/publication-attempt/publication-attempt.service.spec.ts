@@ -51,7 +51,7 @@ describe('PublicationAttemptService', () => {
       '0123456789abcdef0123456789abcdef';
   });
 
-  it('rejects conflicting correlation reuse', async () => {
+  it('rejects conflicting idempotency-key reuse', async () => {
     const database = databaseDouble();
     database.publicationRequest.findUnique.mockResolvedValue({
       requestHash: 'first-request-hash',
@@ -62,13 +62,13 @@ describe('PublicationAttemptService', () => {
     await expect(
       service.resolvePublicationRequest(
         'org-1',
-        'correlation-1',
+        'idempotency-key-1',
         'different-request-hash'
       )
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
-  it('returns the original roots for an idempotent correlation replay', async () => {
+  it('returns the original roots for an idempotent replay', async () => {
     const database = databaseDouble();
     database.publicationRequest.findUnique.mockResolvedValue({
       requestHash: 'same-hash',
@@ -80,7 +80,11 @@ describe('PublicationAttemptService', () => {
     const service = new PublicationAttemptService(database as never);
 
     await expect(
-      service.resolvePublicationRequest('org-1', 'correlation-1', 'same-hash')
+      service.resolvePublicationRequest(
+        'org-1',
+        'idempotency-key-1',
+        'same-hash'
+      )
     ).resolves.toEqual([
       { postId: 'post-1', integration: 'int-1' },
       { postId: 'post-2', integration: 'int-2' },
@@ -96,7 +100,7 @@ describe('PublicationAttemptService', () => {
 
     await service.createPublicationRequest(database as never, {
       organizationId: 'org-1',
-      correlationId: 'correlation-1',
+      idempotencyKey: 'idempotency-key-1',
       requestHash: 'request-hash-1',
       posts: [{ postId: 'post-1', integration: 'integration-1' }],
     });
@@ -104,7 +108,7 @@ describe('PublicationAttemptService', () => {
     expect(database.publicationRequest.create).toHaveBeenCalledWith({
       data: {
         organizationId: 'org-1',
-        correlationId: 'correlation-1',
+        idempotencyKey: 'idempotency-key-1',
         requestHash: 'request-hash-1',
         bindings: {
           create: [
@@ -129,7 +133,7 @@ describe('PublicationAttemptService', () => {
       publicationRequestId: 'request-1',
       publicationRequest: {
         organizationId: 'org-1',
-        correlationId: 'correlation-1',
+        idempotencyKey: 'idempotency-key-1',
       },
     });
     database.publicationAttemptEvent.findUnique.mockResolvedValue({
@@ -189,7 +193,7 @@ describe('PublicationAttemptService', () => {
       publicationRequestId: 'request-1',
       publicationRequest: {
         organizationId: 'org-1',
-        correlationId: 'correlation-1',
+        idempotencyKey: 'idempotency-key-1',
       },
     });
     database.publicationAttemptEvent.findUnique.mockResolvedValue(null);
