@@ -72,6 +72,8 @@ export type PublicationIdempotency = {
   requestHash: string;
 };
 
+const PUBLICATION_REQUEST_TRANSACTION_ATTEMPTS = 3;
+
 @Injectable()
 export class PostsService {
   private storage = UploadFactory.createStorage();
@@ -1027,72 +1029,80 @@ export class PostsService {
     };
 
     if (publicationIdempotency) {
-      try {
-        const persisted = await this._prisma.$transaction(
-          async (database) => {
-            // Close the check/create race inside the transaction. A concurrent
-            // winner is returned without creating or starting duplicate posts.
-            const existing =
-              await this._publicationAttemptService.resolvePublicationRequest(
-                orgId,
-                publicationIdempotency.idempotencyKey,
-                publicationIdempotency.requestHash,
-                database
+      for (let transactionAttempt = 1; ; transactionAttempt++) {
+        try {
+          const persisted = await this._prisma.$transaction(
+            async (database) => {
+              // Close the check/create race inside the transaction. A concurrent
+              // winner is returned without creating or starting duplicate posts.
+              const existing =
+                await this._publicationAttemptService.resolvePublicationRequest(
+                  orgId,
+                  publicationIdempotency.idempotencyKey,
+                  publicationIdempotency.requestHash,
+                  database
+                );
+              if (existing) {
+                return { created: false as const, posts: existing };
+              }
+
+              const posts = [];
+              for (const post of preparedPosts) {
+                const saved = await persistPost(post, database);
+                if (!saved) {
+                  throw new Error('Failed to persist publication request post');
+                }
+                posts.push(saved);
+              }
+
+              await this._publicationAttemptService.createPublicationRequest(
+                database,
+                {
+                  organizationId: orgId,
+                  idempotencyKey: publicationIdempotency.idempotencyKey,
+                  requestHash: publicationIdempotency.requestHash,
+                  posts,
+                }
               );
-            if (existing) {
-              return { created: false as const, posts: existing };
-            }
-
-            const posts = [];
-            for (const post of preparedPosts) {
-              const saved = await persistPost(post, database);
-              if (!saved) {
-                throw new Error('Failed to persist publication request post');
-              }
-              posts.push(saved);
-            }
-
-            await this._publicationAttemptService.createPublicationRequest(
-              database,
-              {
-                organizationId: orgId,
-                idempotencyKey: publicationIdempotency.idempotencyKey,
-                requestHash: publicationIdempotency.requestHash,
-                posts,
-              }
-            );
-            return { created: true as const, posts };
-          },
-          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
-        );
-
-        if (persisted.created) {
-          persisted.posts.forEach(startPersistedWorkflow);
-        }
-        return persisted.posts.map(({ postId, integration }) => ({
-          postId,
-          integration,
-        }));
-      } catch (error) {
-        if (!isUniqueConstraintError(error)) {
-          throw error;
-        }
-
-        // The unique organization/idempotency-key constraint selects one winner.
-        // Its request hash still has to match before this becomes an idempotent
-        // replay rather than a conflict.
-        const existing =
-          await this._publicationAttemptService.resolvePublicationRequest(
-            orgId,
-            publicationIdempotency.idempotencyKey,
-            publicationIdempotency.requestHash
+              return { created: true as const, posts };
+            },
+            { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
           );
-        if (existing) {
-          return existing;
+
+          if (persisted.created) {
+            persisted.posts.forEach(startPersistedWorkflow);
+          }
+          return persisted.posts.map(({ postId, integration }) => ({
+            postId,
+            integration,
+          }));
+        } catch (error) {
+          if (
+            (error as { code?: string })?.code === 'P2034' &&
+            transactionAttempt < PUBLICATION_REQUEST_TRANSACTION_ATTEMPTS
+          ) {
+            continue;
+          }
+          if (!isUniqueConstraintError(error)) {
+            throw error;
+          }
+
+          // The unique organization/idempotency-key constraint selects one winner.
+          // Its request hash still has to match before this becomes an idempotent
+          // replay rather than a conflict.
+          const existing =
+            await this._publicationAttemptService.resolvePublicationRequest(
+              orgId,
+              publicationIdempotency.idempotencyKey,
+              publicationIdempotency.requestHash
+            );
+          if (existing) {
+            return existing;
+          }
+          throw new ConflictException(
+            'A root post in this request is already bound to another idempotency key'
+          );
         }
-        throw new ConflictException(
-          'A root post in this request is already bound to another idempotency key'
-        );
       }
     }
 
