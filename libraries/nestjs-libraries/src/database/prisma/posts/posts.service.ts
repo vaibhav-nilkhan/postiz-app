@@ -184,7 +184,7 @@ export class PostsService {
       post.integration.providerIdentifier
     );
 
-    if (!integrationProvider.postAnalytics) {
+    if (!integrationProvider?.postAnalytics) {
       return [];
     }
 
@@ -229,6 +229,9 @@ export class PostsService {
         post.releaseId,
         date
       );
+      if (!Array.isArray(loadAnalytics)) {
+        return [];
+      }
       await ioRedis.set(
         `integration:${orgId}:${post.id}:${date}`,
         JSON.stringify(loadAnalytics),

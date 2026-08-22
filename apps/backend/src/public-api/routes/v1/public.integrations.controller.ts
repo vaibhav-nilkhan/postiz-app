@@ -12,6 +12,7 @@ import {
   UploadedFile,
   UseInterceptors,
   UsePipes,
+  ValidationPipe,
 } from '@nestjs/common';
 import {
   CustomFileValidationPipe,
@@ -64,6 +65,7 @@ import { PostValidationException } from '@gitroom/backend/api/routes/posts.valid
 import { timer } from '@gitroom/helpers/utils/timer';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 import { canonicalSha256 } from '@gitroom/nestjs-libraries/database/prisma/publication-attempt/publication-attempt.evidence';
+import { PostAnalyticsQueryDto } from '@gitroom/nestjs-libraries/dtos/analytics/post.analytics.query.dto';
 
 @ApiTags('Public API')
 @Controller('/public/v1')
@@ -515,24 +517,20 @@ export class PublicIntegrationsController {
     return this._postsService.updateReleaseId(org.id, id, releaseId);
   }
 
-  @Get('/analytics/:integration')
-  async getAnalytics(
-    @GetOrgFromRequest() org: Organization,
-    @Param('integration') integration: string,
-    @Query('date') date: string
-  ) {
-    Sentry.metrics.count('public_api-request', 1);
-    return this._integrationService.checkAnalytics(org, integration, date);
-  }
-
   @Get('/analytics/post/:postId')
   async getPostAnalytics(
     @GetOrgFromRequest() org: Organization,
     @Param('postId') postId: string,
-    @Query('date') date: string
+    @Query(
+      new ValidationPipe({
+        transform: true,
+        expectedType: PostAnalyticsQueryDto,
+      })
+    )
+    query: PostAnalyticsQueryDto
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    return this._postsService.checkPostAnalytics(org.id, postId, +date);
+    return this._postsService.checkPostAnalytics(org.id, postId, query.date);
   }
 
   @Post('/integration-trigger/:id')
