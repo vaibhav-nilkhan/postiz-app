@@ -286,10 +286,18 @@ export class IntegrationRepository {
           organizationId: org,
         },
       },
-      select: { id: true, providerIdentifier: true },
+      select: { id: true, providerIdentifier: true, customerId: true },
     });
     if (existing && existing.providerIdentifier !== provider) {
       throw new Error('Integration provider mismatch');
+    }
+    if (
+      connectionAttempt &&
+      existing &&
+      existing.customerId !== null &&
+      existing.customerId !== connectionAttempt.customerId
+    ) {
+      throw new Error('Existing integration belongs to a different customer');
     }
 
     const upsert = await integrations.upsert({

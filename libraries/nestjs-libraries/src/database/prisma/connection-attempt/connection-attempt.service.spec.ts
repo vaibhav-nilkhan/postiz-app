@@ -4,6 +4,7 @@ import {
   ConnectionAttemptStatus,
 } from '@prisma/client';
 import { ConnectionAttemptService } from './connection-attempt.service';
+import { ConnectionAttemptCustodyConflictError } from './connection-attempt.repository';
 
 const directProvider = {
   identifier: 'direct',
@@ -119,7 +120,7 @@ class MemoryRepository {
       reconnectIntegration: input.reconnectIntegrationId
         ? this.reconnects.get(input.reconnectIntegrationId)
         : null,
-      status: ConnectionAttemptStatus.PENDING,
+      status: 'INITIALIZING',
       interimIntegrationId: null,
       interimIntegration: null,
       finalIntegrationId: null,
@@ -159,6 +160,7 @@ class MemoryRepository {
     const attempt = this.attempts.get(id);
     if (!attempt || attempt.stateHash) return null;
     Object.assign(attempt, {
+      status: ConnectionAttemptStatus.PENDING,
       stateHash,
       stateCorrelation,
       authorizationContext,
@@ -194,6 +196,31 @@ class MemoryRepository {
     const attempt = this.attempts.get(id);
     if (attempt?.status === ConnectionAttemptStatus.AUTHENTICATING) {
       attempt.authorizationContext = null;
+    }
+  }
+
+  async heartbeatInitialization(id: string) {
+    const attempt = this.attempts.get(id);
+    if (attempt?.status === 'INITIALIZING') {
+      attempt.updatedAt = new Date();
+    }
+  }
+
+  async failStaleInitialization(
+    id: string,
+    organizationId: string,
+    staleBefore: Date
+  ) {
+    const attempt = this.attempts.get(id);
+    if (
+      attempt?.organizationId === organizationId &&
+      attempt.status === 'INITIALIZING' &&
+      attempt.updatedAt <= staleBefore
+    ) {
+      attempt.status = ConnectionAttemptStatus.FAILED;
+      attempt.failureCode = 'INITIALIZATION_FAILED';
+      attempt.failedAt = new Date();
+      attempt.stateConsumedAt = new Date();
     }
   }
 
@@ -408,16 +435,179 @@ describe('ConnectionAttemptService', () => {
     ).rejects.toThrow('not found');
   });
 
-  it('serializes concurrent creates to one generated authorization URL', async () => {
-    const { service, repository } = harness();
-    const [first, second] = await Promise.all([
-      service.create({ id: 'org-1' } as never, createBody),
-      service.create({ id: 'org-1' } as never, createBody),
-    ]);
+  it('durably records definitive initialization failures without regeneration', async () => {
+    for (const failure of ['generation', 'binding', 'encryption'] as const) {
+      const provider = {
+        ...directProvider,
+        generateAuthUrl: vi.fn(async () => {
+          if (failure === 'generation') {
+            throw new Error('unsafe provider detail');
+          }
+          return {
+            url:
+              failure === 'binding'
+                ? 'http://provider.test/oauth?state=weak-state'
+                : 'https://provider.test/oauth?state=weak-state',
+            state: 'weak-state',
+            codeVerifier: 'pkce-verifier',
+          };
+        }),
+      };
+      const { service, repository } = harness(provider);
+      if (failure === 'encryption') {
+        process.env.POSTIZ_CONNECTION_ATTEMPT_SECRET = 'too-short';
+      }
+      const body = {
+        ...createBody,
+        externalOperationRef: `initialization-${failure}`,
+      };
 
-    expect(second).toEqual(first);
-    expect(directProvider.generateAuthUrl).toHaveBeenCalledOnce();
+      const failed = await service.create({ id: 'org-1' } as never, body);
+      expect(failed).toMatchObject({
+        status: 'failed',
+        failureCode: 'initialization_failed',
+      });
+      expect(JSON.stringify(failed)).not.toContain('unsafe provider detail');
+      expect(failed).not.toHaveProperty('authorizationUrl');
+
+      const recovered = await service.readByExternalOperation(
+        'org-1',
+        body.externalOperationRef
+      );
+      expect(recovered).toEqual(failed);
+      expect(provider.generateAuthUrl).toHaveBeenCalledOnce();
+      expect(repository.attempts.size).toBe(1);
+      await expect(
+        service.create({ id: 'org-1' } as never, body)
+      ).resolves.toEqual(failed);
+      expect(provider.generateAuthUrl).toHaveBeenCalledOnce();
+
+      process.env.POSTIZ_CONNECTION_ATTEMPT_SECRET =
+        '0123456789abcdef0123456789abcdef';
+    }
+  });
+
+  it('returns a live initializer immediately and fails it after the lease', async () => {
+    const { service, repository } = harness();
+    const reservation = await repository.reserve({
+      id: '00000000-0000-0000-0000-000000000001',
+      organizationId: 'org-1',
+      customerId: createBody.customerId,
+      externalOperationRef: 'crashed-initializer',
+      externalWorkspaceRef: createBody.externalWorkspaceRef,
+      externalActorRef: createBody.externalActorRef,
+      provider: createBody.provider,
+      purpose: 'CONNECT',
+      returnTarget: createBody.returnTarget,
+      expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+    });
+
+    await expect(
+      service.readByExternalOperation('org-1', 'crashed-initializer')
+    ).resolves.toMatchObject({ status: 'initializing' });
+    reservation.attempt.updatedAt = new Date(Date.now() - 61_000);
+
+    const failed = await service.readByExternalOperation(
+      'org-1',
+      'crashed-initializer'
+    );
+    expect(failed).toMatchObject({
+      status: 'failed',
+      failureCode: 'initialization_failed',
+    });
+    expect(directProvider.generateAuthUrl).not.toHaveBeenCalled();
+    await expect(
+      service.read('org-1', reservation.attempt.id)
+    ).resolves.toEqual(failed);
+  });
+
+  it('serializes concurrent creates without waiting or regenerating', async () => {
+    let finishGeneration!: (value: {
+      url: string;
+      state: string;
+      codeVerifier: string;
+    }) => void;
+    const provider = {
+      ...directProvider,
+      generateAuthUrl: vi.fn(
+        () =>
+          new Promise<{
+            url: string;
+            state: string;
+            codeVerifier: string;
+          }>((resolve) => {
+            finishGeneration = resolve;
+          })
+      ),
+    };
+    const { service, repository } = harness(provider);
+    const firstCreate = service.create({ id: 'org-1' } as never, createBody);
+    await vi.waitFor(() => expect(repository.attempts.size).toBe(1));
+
+    const concurrent = await service.create(
+      { id: 'org-1' } as never,
+      createBody
+    );
+    expect(concurrent).toMatchObject({ status: 'initializing' });
+    expect(concurrent).not.toHaveProperty('authorizationUrl');
+
+    finishGeneration({
+      url: 'https://provider.test/oauth?state=weak-state',
+      state: 'weak-state',
+      codeVerifier: 'pkce-verifier',
+    });
+    const first = await firstCreate;
+    await expect(
+      service.readByExternalOperation('org-1', createBody.externalOperationRef)
+    ).resolves.toEqual(first);
+    expect(provider.generateAuthUrl).toHaveBeenCalledOnce();
     expect(repository.attempts.size).toBe(1);
+  });
+
+  it('renews the lease while a legitimate initializer is in flight', async () => {
+    vi.useFakeTimers();
+    try {
+      let finishGeneration!: (value: {
+        url: string;
+        state: string;
+        codeVerifier: string;
+      }) => void;
+      const provider = {
+        ...directProvider,
+        generateAuthUrl: vi.fn(
+          () =>
+            new Promise<{
+              url: string;
+              state: string;
+              codeVerifier: string;
+            }>((resolve) => {
+              finishGeneration = resolve;
+            })
+        ),
+      };
+      const { service, repository } = harness(provider);
+      const firstCreate = service.create({ id: 'org-1' } as never, createBody);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(repository.attempts.size).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(61_000);
+      await expect(
+        service.readByExternalOperation(
+          'org-1',
+          createBody.externalOperationRef
+        )
+      ).resolves.toMatchObject({ status: 'initializing' });
+
+      finishGeneration({
+        url: 'https://provider.test/oauth?state=weak-state',
+        state: 'weak-state',
+        codeVerifier: 'pkce-verifier',
+      });
+      await expect(firstCreate).resolves.toMatchObject({ status: 'pending' });
+      expect(provider.generateAuthUrl).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('rejects reuse of an external operation with mismatched identity', async () => {
@@ -535,6 +725,28 @@ describe('ConnectionAttemptService', () => {
     }
   });
 
+  it('fails a definitive direct customer custody conflict before mutation', async () => {
+    const { service, repository } = harness();
+    repository.completeAuthenticationError =
+      new ConnectionAttemptCustodyConflictError(
+        'Existing integration belongs to a different customer'
+      );
+    const { state } = await createdAttempt(service, {
+      ...createBody,
+      externalOperationRef: 'direct-customer-conflict',
+    });
+
+    const callback = await service.tryHandleCallback('direct', {
+      state,
+      code: 'one-time-code',
+      timezone: '0',
+    });
+    expect(callback?.postifyConnectionAttempt).toMatchObject({
+      status: 'failed',
+      failureCode: 'conflict',
+    });
+  });
+
   it('fails a definitive malformed authentication response', async () => {
     const provider = {
       ...directProvider,
@@ -609,13 +821,21 @@ describe('ConnectionAttemptService', () => {
       ...createBody,
       provider: 'two-step',
     });
-    await service.tryHandleCallback('two-step', {
+    const callback = await service.tryHandleCallback('two-step', {
       state,
       code: 'authorization-code',
       timezone: '0',
     });
 
     const pending = await service.read('org-1', created.id);
+    expect(callback).toMatchObject({
+      inBetweenSteps: false,
+      returnURL: 'https://postify.test/settings/social/callback',
+      postifyConnectionAttempt: {
+        status: 'awaiting_selection',
+        metadata: { selection: expect.any(Array) },
+      },
+    });
     expect(pending.status).toBe('awaiting_selection');
     expect(pending.metadata?.selection).toEqual([
       expect.objectContaining({ name: 'Safe page', username: 'safe-page' }),
@@ -711,6 +931,35 @@ describe('ConnectionAttemptService', () => {
         service.finalizeSelection('org-1', created.id, 'f'.repeat(32))
       ).rejects.toThrow('selection is invalid');
     }
+  });
+
+  it('fails a definitive two-step customer custody conflict before mutation', async () => {
+    const { service, repository } = harness(twoStepProvider);
+    const { created, state } = await createdAttempt(service, {
+      ...createBody,
+      provider: 'two-step',
+      externalOperationRef: 'two-step-customer-conflict',
+    });
+    await service.tryHandleCallback('two-step', {
+      state,
+      code: 'authorization-code',
+      timezone: '0',
+    });
+    const pending = await service.read('org-1', created.id);
+    repository.completeSelectionError =
+      new ConnectionAttemptCustodyConflictError(
+        'Existing integration belongs to a different customer'
+      );
+
+    const failed = await service.finalizeSelection(
+      'org-1',
+      created.id,
+      pending.metadata!.selection[0].id
+    );
+    expect(failed).toMatchObject({
+      status: 'failed',
+      failureCode: 'conflict',
+    });
   });
 
   it('fails a definitive mismatched selection response', async () => {

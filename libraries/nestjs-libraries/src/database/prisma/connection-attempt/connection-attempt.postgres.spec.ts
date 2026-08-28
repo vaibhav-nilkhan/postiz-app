@@ -7,6 +7,7 @@ const enabled = process.env.POSTIZ_CONNECTION_ATTEMPT_POSTGRES_TEST === '1';
 const migrations = [
   '20260828000000_postify_connection_attempts',
   '20260828010000_connection_attempt_idempotency_and_custody',
+  '20260828020000_connection_attempt_initialization_custody',
 ].map((name) =>
   path.resolve(
     process.cwd(),
@@ -51,13 +52,13 @@ function attempt(values: {
       "id", "organizationId", "customerId", "externalOperationRef",
       "externalWorkspaceRef", "provider", "purpose",
       "reconnectIntegrationId", "returnTarget", "stateHash",
-      "stateCorrelation", "authorizationContext", "expiresAt"
+      "stateCorrelation", "authorizationContext", "status", "expiresAt"
     ) VALUES (
       '${values.id}', '${values.organization || 'org-1'}',
       '${values.customer || 'customer-1'}', '${values.operation}',
       'workspace-1', '${values.provider || 'direct'}', '${purpose}',
       ${reconnect}, 'postify', '${stateHash}', repeat('b', 64),
-      'encrypted-authorization-context', NOW() + INTERVAL '15 minutes'
+      'encrypted-authorization-context', 'PENDING', NOW() + INTERVAL '15 minutes'
     );
   `;
 }
@@ -105,7 +106,7 @@ describe.runIf(enabled)(
         ('customer-2', 'org-2'),
         ('customer-3', 'org-1');
     `);
-      for (const migration of migrations) {
+      for (const [index, migration] of migrations.entries()) {
         expect(fs.existsSync(migration)).toBe(true);
         execFileSync(
           'psql',
@@ -114,6 +115,19 @@ describe.runIf(enabled)(
             stdio: ['ignore', 'pipe', 'pipe'],
           }
         );
+        if (index === 1) {
+          psql(`
+            INSERT INTO "ConnectionAttempt" (
+              "id", "organizationId", "customerId", "externalOperationRef",
+              "externalWorkspaceRef", "provider", "purpose", "returnTarget",
+              "expiresAt"
+            ) VALUES (
+              'ffffffff-0000-0000-0000-000000000001', 'org-1', 'customer-1',
+              'pre-migration-initializer', 'workspace-1', 'direct', 'CONNECT',
+              'postify', NOW() + INTERVAL '15 minutes'
+            );
+          `);
+        }
       }
     });
 
@@ -159,7 +173,7 @@ describe.runIf(enabled)(
       expect(() =>
         psql(`
           UPDATE "ConnectionAttempt"
-          SET "stateHash" = repeat('d', 64),
+          SET "status" = 'PENDING', "stateHash" = repeat('d', 64),
               "stateCorrelation" = repeat('e', 64),
               "authorizationContext" = 'encrypted-url-and-verifier'
           WHERE "id" = '00000000-0000-0000-0000-000000000001';
@@ -198,6 +212,79 @@ describe.runIf(enabled)(
       `,
         'connection attempt identity is immutable'
       );
+    });
+
+    it('enforces finite initialization activation and failure transitions', () => {
+      expect(
+        psql(`
+          SELECT "status" || ':' || "failureCode" FROM "ConnectionAttempt"
+          WHERE "id" = 'ffffffff-0000-0000-0000-000000000001';
+        `).trim()
+      ).toBe('FAILED:INITIALIZATION_FAILED');
+
+      psql(`
+        INSERT INTO "ConnectionAttempt" (
+          "id", "organizationId", "customerId", "externalOperationRef",
+          "externalWorkspaceRef", "provider", "purpose", "returnTarget",
+          "expiresAt"
+        ) VALUES (
+          '01000000-0000-0000-0000-000000000001', 'org-1', 'customer-1',
+          'initializer-1', 'workspace-1', 'direct', 'CONNECT', 'postify',
+          NOW() + INTERVAL '15 minutes'
+        );
+      `);
+      expect(
+        psql(`
+          SELECT "status" FROM "ConnectionAttempt"
+          WHERE "id" = '01000000-0000-0000-0000-000000000001';
+        `).trim()
+      ).toBe('INITIALIZING');
+      expect(() =>
+        psql(`
+          UPDATE "ConnectionAttempt"
+          SET "updatedAt" = NOW() + INTERVAL '1 second'
+          WHERE "id" = '01000000-0000-0000-0000-000000000001';
+        `)
+      ).not.toThrow();
+      expectRejected(
+        `
+          UPDATE "ConnectionAttempt"
+          SET "status" = 'AUTHENTICATING', "stateConsumedAt" = NOW()
+          WHERE "id" = '01000000-0000-0000-0000-000000000001';
+        `,
+        'invalid connection attempt status transition'
+      );
+      expect(() =>
+        psql(`
+          UPDATE "ConnectionAttempt"
+          SET "status" = 'FAILED', "failureCode" = 'INITIALIZATION_FAILED',
+              "failedAt" = NOW(), "stateConsumedAt" = NOW()
+          WHERE "id" = '01000000-0000-0000-0000-000000000001';
+        `)
+      ).not.toThrow();
+
+      psql(`
+        INSERT INTO "ConnectionAttempt" (
+          "id", "organizationId", "customerId", "externalOperationRef",
+          "externalWorkspaceRef", "provider", "purpose", "returnTarget",
+          "expiresAt"
+        ) VALUES (
+          '01000000-0000-0000-0000-000000000002', 'org-1', 'customer-1',
+          'initializer-2', 'workspace-1', 'direct', 'CONNECT', 'postify',
+          NOW() + INTERVAL '15 minutes'
+        );
+        UPDATE "ConnectionAttempt"
+        SET "status" = 'PENDING', "stateHash" = repeat('f', 64),
+            "stateCorrelation" = repeat('a', 64),
+            "authorizationContext" = 'encrypted-url-and-verifier'
+        WHERE "id" = '01000000-0000-0000-0000-000000000002';
+      `);
+      expect(
+        psql(`
+          SELECT "status" FROM "ConnectionAttempt"
+          WHERE "id" = '01000000-0000-0000-0000-000000000002';
+        `).trim()
+      ).toBe('PENDING');
     });
 
     it('accepts normal direct, reauthorization, and two-step custody transitions', () => {

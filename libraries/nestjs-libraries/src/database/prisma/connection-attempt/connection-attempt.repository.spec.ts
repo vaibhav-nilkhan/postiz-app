@@ -46,6 +46,11 @@ describe('ConnectionAttemptRepository atomic ownership', () => {
     database.connectionAttempt.findUniqueOrThrow.mockResolvedValue(
       authenticatingAttempt
     );
+    database.integration.findUnique.mockResolvedValue({
+      id: 'integration-1',
+      providerIdentifier: 'direct',
+      customerId: 'customer-1',
+    });
     database.connectionAttempt.findUnique.mockResolvedValue({
       ...authenticatingAttempt,
       status: ConnectionAttemptStatus.SUCCEEDED,
@@ -105,6 +110,77 @@ describe('ConnectionAttemptRepository atomic ownership', () => {
     });
   });
 
+  it('rejects a direct legacy integration owned by another customer before mutation', async () => {
+    const { database, prisma } = transactionDatabase();
+    database.connectionAttempt.findUniqueOrThrow.mockResolvedValue(
+      authenticatingAttempt
+    );
+    database.integration.findUnique.mockResolvedValue({
+      id: 'legacy-integration',
+      providerIdentifier: 'direct',
+      customerId: 'customer-2',
+    });
+    const integrations = {
+      createOrUpdateIntegration: vi.fn(),
+    };
+    const repository = new ConnectionAttemptRepository(
+      prisma as never,
+      integrations as never
+    );
+
+    await expect(
+      repository.completeAuthentication({
+        attemptId: 'attempt-1',
+        details: {
+          id: 'account-1',
+          name: 'Account',
+          accessToken: 'new-secret-token',
+        },
+        oneTimeToken: false,
+      })
+    ).rejects.toThrow('different customer');
+    expect(integrations.createOrUpdateIntegration).not.toHaveBeenCalled();
+    expect(database.connectionAttempt.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects reauthorization when reconnect customer custody changed', async () => {
+    const { database, prisma } = transactionDatabase();
+    database.connectionAttempt.findUniqueOrThrow.mockResolvedValue({
+      ...authenticatingAttempt,
+      purpose: ConnectionAttemptPurpose.REAUTHORIZE,
+      reconnectIntegrationId: 'integration-1',
+      reconnectIntegration: {
+        id: 'integration-1',
+        organizationId: 'org-1',
+        customerId: 'customer-2',
+        providerIdentifier: 'direct',
+        internalId: 'account-1',
+        deletedAt: null,
+      },
+    });
+    const integrations = {
+      createOrUpdateIntegration: vi.fn(),
+    };
+    const repository = new ConnectionAttemptRepository(
+      prisma as never,
+      integrations as never
+    );
+
+    await expect(
+      repository.completeAuthentication({
+        attemptId: 'attempt-1',
+        details: {
+          id: 'account-1',
+          name: 'Account',
+          accessToken: 'new-secret-token',
+        },
+        oneTimeToken: false,
+      })
+    ).rejects.toThrow('custody changed');
+    expect(integrations.createOrUpdateIntegration).not.toHaveBeenCalled();
+    expect(database.connectionAttempt.updateMany).not.toHaveBeenCalled();
+  });
+
   it('atomically verifies interim ownership, assigns customer, and succeeds', async () => {
     const { database, prisma } = transactionDatabase();
     const interim = {
@@ -128,6 +204,10 @@ describe('ConnectionAttemptRepository atomic ownership', () => {
     database.integration.findUnique.mockResolvedValue(null);
     database.integration.update.mockResolvedValue({ id: 'interim-1' });
     database.connectionAttempt.findUnique.mockResolvedValue({
+      id: 'attempt-1',
+      status: ConnectionAttemptStatus.SUCCEEDED,
+    });
+    database.connectionAttempt.findUniqueOrThrow.mockResolvedValue({
       id: 'attempt-1',
       status: ConnectionAttemptStatus.SUCCEEDED,
     });
@@ -206,6 +286,106 @@ describe('ConnectionAttemptRepository atomic ownership', () => {
     expect(database.integration.update).not.toHaveBeenCalled();
     expect(database.connectionAttempt.updateMany).not.toHaveBeenCalled();
   });
+
+  it('rejects a two-step legacy integration owned by another customer before mutation', async () => {
+    const { database, prisma } = transactionDatabase();
+    database.connectionAttempt.findFirstOrThrow.mockResolvedValue({
+      id: 'attempt-1',
+      organizationId: 'org-1',
+      customerId: 'customer-1',
+      provider: 'two-step',
+      interimIntegration: {
+        id: 'interim-1',
+        organizationId: 'org-1',
+        customerId: 'customer-1',
+        providerIdentifier: 'two-step',
+        inBetweenSteps: true,
+        deletedAt: null,
+      },
+    });
+    database.integration.findUnique.mockResolvedValue({
+      id: 'legacy-page',
+      providerIdentifier: 'two-step',
+      customerId: 'customer-2',
+    });
+    const repository = new ConnectionAttemptRepository(
+      prisma as never,
+      {} as never
+    );
+
+    await expect(
+      repository.completeSelection({
+        organizationId: 'org-1',
+        attemptId: 'attempt-1',
+        selectionId: 'a'.repeat(32),
+        information: {
+          id: 'page-1',
+          name: 'Page',
+          access_token: 'new-page-token',
+        },
+      })
+    ).rejects.toThrow('different customer');
+    expect(database.integration.update).not.toHaveBeenCalled();
+    expect(database.connectionAttempt.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('preserves a same-customer two-step legacy integration', async () => {
+    const { database, prisma } = transactionDatabase();
+    database.connectionAttempt.findFirstOrThrow.mockResolvedValue({
+      id: 'attempt-1',
+      organizationId: 'org-1',
+      customerId: 'customer-1',
+      provider: 'two-step',
+      interimIntegration: {
+        id: 'interim-1',
+        organizationId: 'org-1',
+        customerId: 'customer-1',
+        providerIdentifier: 'two-step',
+        inBetweenSteps: true,
+        deletedAt: null,
+        refreshToken: 'refresh-secret',
+      },
+    });
+    database.integration.findUnique.mockResolvedValue({
+      id: 'legacy-page',
+      providerIdentifier: 'two-step',
+      customerId: 'customer-1',
+    });
+    database.integration.update
+      .mockResolvedValueOnce({ id: 'interim-1' })
+      .mockResolvedValueOnce({ id: 'legacy-page' });
+    database.connectionAttempt.findUnique.mockResolvedValue({
+      id: 'attempt-1',
+      status: ConnectionAttemptStatus.SUCCEEDED,
+    });
+    database.connectionAttempt.findUniqueOrThrow.mockResolvedValue({
+      id: 'attempt-1',
+      status: ConnectionAttemptStatus.SUCCEEDED,
+    });
+    const repository = new ConnectionAttemptRepository(
+      prisma as never,
+      {} as never
+    );
+
+    await expect(
+      repository.completeSelection({
+        organizationId: 'org-1',
+        attemptId: 'attempt-1',
+        selectionId: 'a'.repeat(32),
+        information: {
+          id: 'page-1',
+          name: 'Page',
+          access_token: 'new-page-token',
+        },
+      })
+    ).resolves.toBeDefined();
+    expect(database.integration.update).toHaveBeenCalledTimes(2);
+    expect(database.connectionAttempt.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ finalIntegrationId: 'legacy-page' }),
+      })
+    );
+  });
 });
 
 describe('IntegrationRepository shared ownership hardening', () => {
@@ -263,4 +443,125 @@ describe('IntegrationRepository shared ownership hardening', () => {
       })
     );
   });
+
+  it('rejects connection-attempt token/customer mutation of another customer', async () => {
+    const integrations = {
+      findUnique: vi.fn(async () => ({
+        id: 'legacy-integration',
+        providerIdentifier: 'direct',
+        customerId: 'customer-2',
+      })),
+      upsert: vi.fn(),
+    };
+    const repository = new IntegrationRepository(
+      { model: { integration: integrations } } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never
+    );
+
+    await expect(
+      repository.createOrUpdateIntegration(
+        undefined,
+        false,
+        'org-1',
+        'Account',
+        undefined,
+        'social',
+        'account-1',
+        'direct',
+        'new-secret-token',
+        '',
+        undefined,
+        undefined,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        { customerId: 'customer-1' }
+      )
+    ).rejects.toThrow('different customer');
+    expect(integrations.upsert).not.toHaveBeenCalled();
+  });
+
+  it('preserves the existing manual integration upsert path', async () => {
+    const integrations = {
+      findUnique: vi.fn(async () => ({
+        id: 'legacy-integration',
+        providerIdentifier: 'direct',
+        customerId: 'customer-2',
+      })),
+      upsert: vi.fn(async () => ({ id: 'legacy-integration' })),
+    };
+    const repository = new IntegrationRepository(
+      { model: { integration: integrations } } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never
+    );
+
+    await expect(
+      repository.createOrUpdateIntegration(
+        undefined,
+        false,
+        'org-1',
+        'Account',
+        undefined,
+        'social',
+        'account-1',
+        'direct',
+        'new-secret-token'
+      )
+    ).resolves.toEqual({ id: 'legacy-integration' });
+    expect(integrations.upsert).toHaveBeenCalledOnce();
+  });
+
+  it.each(['customer-1', null])(
+    'allows connection-attempt recovery for existing customer %s',
+    async (existingCustomerId) => {
+      const integrations = {
+        findUnique: vi.fn(async () => ({
+          id: 'legacy-integration',
+          providerIdentifier: 'direct',
+          customerId: existingCustomerId,
+        })),
+        upsert: vi.fn(async () => ({ id: 'legacy-integration' })),
+      };
+      const repository = new IntegrationRepository(
+        { model: { integration: integrations } } as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never
+      );
+
+      await expect(
+        repository.createOrUpdateIntegration(
+          undefined,
+          false,
+          'org-1',
+          'Account',
+          undefined,
+          'social',
+          'account-1',
+          'direct',
+          'new-secret-token',
+          '',
+          undefined,
+          undefined,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          { customerId: 'customer-1' }
+        )
+      ).resolves.toEqual({ id: 'legacy-integration' });
+      expect(integrations.upsert).toHaveBeenCalledOnce();
+    }
+  );
 });

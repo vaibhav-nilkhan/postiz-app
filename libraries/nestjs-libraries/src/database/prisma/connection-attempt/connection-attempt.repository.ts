@@ -10,6 +10,7 @@ import { IntegrationRepository } from '@gitroom/nestjs-libraries/database/prisma
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 
 const activeStatuses: ConnectionAttemptStatus[] = [
+  ConnectionAttemptStatus.INITIALIZING,
   ConnectionAttemptStatus.PENDING,
   ConnectionAttemptStatus.AUTHENTICATING,
   ConnectionAttemptStatus.AWAITING_SELECTION,
@@ -61,6 +62,8 @@ type AuthenticatedConnection = {
   }>;
 };
 
+export class ConnectionAttemptCustodyConflictError extends Error {}
+
 @Injectable()
 export class ConnectionAttemptRepository {
   constructor(
@@ -103,7 +106,7 @@ export class ConnectionAttemptRepository {
   }) {
     try {
       const attempt = await this._prisma.connectionAttempt.create({
-        data: input,
+        data: { ...input, status: ConnectionAttemptStatus.INITIALIZING },
         include: attemptInclude,
       });
       return { attempt, created: true as const };
@@ -143,12 +146,17 @@ export class ConnectionAttemptRepository {
     const activated = await this._prisma.connectionAttempt.updateMany({
       where: {
         id,
-        status: ConnectionAttemptStatus.PENDING,
+        status: ConnectionAttemptStatus.INITIALIZING,
         stateHash: null,
         stateCorrelation: null,
         authorizationContext: null,
       },
-      data: { stateHash, stateCorrelation, authorizationContext },
+      data: {
+        status: ConnectionAttemptStatus.PENDING,
+        stateHash,
+        stateCorrelation,
+        authorizationContext,
+      },
     });
     if (activated.count !== 1) {
       return null;
@@ -197,6 +205,35 @@ export class ConnectionAttemptRepository {
         authorizationContext: { not: null },
       },
       data: { authorizationContext: null },
+    });
+  }
+
+  heartbeatInitialization(id: string) {
+    return this._prisma.connectionAttempt.updateMany({
+      where: { id, status: ConnectionAttemptStatus.INITIALIZING },
+      data: { updatedAt: new Date() },
+    });
+  }
+
+  failStaleInitialization(
+    id: string,
+    organizationId: string,
+    staleBefore: Date
+  ) {
+    const now = new Date();
+    return this._prisma.connectionAttempt.updateMany({
+      where: {
+        id,
+        organizationId,
+        status: ConnectionAttemptStatus.INITIALIZING,
+        updatedAt: { lte: staleBefore },
+      },
+      data: {
+        status: ConnectionAttemptStatus.FAILED,
+        failureCode: ConnectionAttemptFailureCode.INITIALIZATION_FAILED,
+        failedAt: now,
+        stateConsumedAt: now,
+      },
     });
   }
 
@@ -298,13 +335,34 @@ export class ConnectionAttemptRepository {
             attempt.reconnectIntegration.internalId !== input.details.id ||
             attempt.reconnectIntegration.deletedAt)
         ) {
-          throw new Error('Reconnect identity mismatch');
+          throw new ConnectionAttemptCustodyConflictError(
+            'Reconnect integration custody changed'
+          );
         }
 
         const betweenSteps = !!input.selectionOptions;
         const internalId = betweenSteps
           ? `postify-attempt:${attempt.id}`
           : input.details.id;
+        const existingIntegration = await database.integration.findUnique({
+          where: {
+            organizationId_internalId: {
+              organizationId: attempt.organizationId,
+              internalId,
+            },
+          },
+          select: { id: true, providerIdentifier: true, customerId: true },
+        });
+        if (
+          existingIntegration &&
+          (existingIntegration.providerIdentifier !== attempt.provider ||
+            (existingIntegration.customerId !== null &&
+              existingIntegration.customerId !== attempt.customerId))
+        ) {
+          throw new ConnectionAttemptCustodyConflictError(
+            'Existing integration belongs to a different customer or provider'
+          );
+        }
         const integration = await this._integrations.createOrUpdateIntegration(
           input.details.additionalSettings,
           input.oneTimeToken,
@@ -499,8 +557,15 @@ export class ConnectionAttemptRepository {
             },
           },
         });
-        if (existing && existing.providerIdentifier !== attempt.provider) {
-          throw new Error('Final integration provider mismatch');
+        if (
+          existing &&
+          (existing.providerIdentifier !== attempt.provider ||
+            (existing.customerId !== null &&
+              existing.customerId !== attempt.customerId))
+        ) {
+          throw new ConnectionAttemptCustodyConflictError(
+            'Existing integration belongs to a different customer or provider'
+          );
         }
 
         let finalIntegrationId = interim.id;

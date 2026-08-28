@@ -13,12 +13,12 @@ All machine routes use a dedicated `Authorization` API-key middleware that
 rejects Postiz public OAuth bearer tokens. The API-key-derived organization is
 authoritative; no request field can select an organization.
 
-| Method | Route                                                                     | Purpose                                                                   |
-| ------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `POST` | `/public/v1/postify/connection-attempts`                                  | Idempotently create an expiring attempt and return its authorization URL. |
-| `GET`  | `/public/v1/postify/connection-attempts/:id`                              | Poll a safe lifecycle projection; never recover an authorization URL.     |
-| `GET`  | `/public/v1/postify/connection-attempts/external-operation/:operationRef` | Recover a lost pending create response by Postify operation identity.     |
-| `POST` | `/public/v1/postify/connection-attempts/:id/selection`                    | Finalize one provider-safe option for a two-step provider.                |
+| Method | Route                                                                     | Purpose                                                                       |
+| ------ | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `POST` | `/public/v1/postify/connection-attempts`                                  | Idempotently reserve an attempt and return its durable authorization outcome. |
+| `GET`  | `/public/v1/postify/connection-attempts/:id`                              | Poll a safe lifecycle projection; never recover an authorization URL.         |
+| `GET`  | `/public/v1/postify/connection-attempts/external-operation/:operationRef` | Recover a lost pending create response by Postify operation identity.         |
+| `POST` | `/public/v1/postify/connection-attempts/:id/selection`                    | Finalize one provider-safe option for a two-step provider.                    |
 
 The create body is schema version 1:
 
@@ -40,10 +40,17 @@ exact same customer/workspace/actor/provider/purpose/reconnect/return identity
 returns the same attempt. While that attempt is still pending, create and the
 external-operation recovery route return the exact original `authorizationUrl`
 without calling `generateAuthUrl` again. Identity reuse with any mismatch fails
-closed. Concurrent create requests reserve one database row; a request that
-arrives while its authorization URL is still being initialized waits briefly or
-returns an initializing conflict that is safe to retry by operation identity.
-An expired or consumed operation is never recycled into a new attempt.
+closed. Concurrent create requests reserve one database row in `initializing`;
+other create/recovery requests immediately return that finite state without
+calling the provider. Activation moves it to `pending` only after the exact URL
+and state are durably stored. A caught generation, binding, or encryption error,
+or activation failure that remains uncommitted, moves it to `failed` with
+`initialization_failed`; a committed activation wins when reread. A process-
+interrupted initializer is given a renewable 60-second lease (heartbeated while
+generation is in flight), then the next ID or operation read atomically applies
+the same failure after its last heartbeat. Neither path races a live initializer
+or regenerates an uncertain OAuth/OAuth1 operation. An expired, failed, or
+consumed operation is never recycled into a new attempt.
 
 `purpose: "reauthorize"` also requires `reconnectIntegrationId`. That
 integration must be active and match the authenticated organization, exact
@@ -51,18 +58,22 @@ customer, and provider. Reauthorization preserves its Postiz integration ID and
 fails with `account_mismatch` if the provider result cannot prove the same
 provider account/page/channel.
 
-Create returns `schemaVersion: 1`, the safe poll projection, and (only while
-pending) `authorizationUrl`. The normal ID poll and finalize return only the
-finite status, bound attempt
-identity, expiry, safe failure code, provider-safe selection display metadata,
-truthful local lifecycle, and (only after success) `finalIntegrationId`.
+Create returns `schemaVersion: 1`, the safe poll projection, and (only after
+durable activation while pending) `authorizationUrl`. A concurrent initializer
+may therefore return `initializing` without a URL. The normal ID poll and
+finalize return only the finite status, bound attempt identity, expiry, safe
+failure code, provider-safe selection display metadata, truthful local
+lifecycle, and (only after success) `finalIntegrationId`.
 Two-step finalization accepts only the opaque `selectionId` previously returned
 by poll; caller-supplied provider payloads are not accepted.
 
-Statuses are `pending`, `authenticating`, `awaiting_selection`, `finalizing`,
-`succeeded`, `failed`, and `expired`. Failure codes are a closed enum. A database
-trigger enforces immutable identity fields and one-way transitions. State is
-random (or, for OAuth 1 providers, the provider's high-entropy request token),
+Statuses are `initializing`, `pending`, `authenticating`, `awaiting_selection`,
+`finalizing`, `succeeded`, `failed`, and `expired`. Failure codes are a closed
+enum. `initialization_failed` means only that no usable authorization URL was
+durably established; it does not claim that the provider observed no request or
+created no provider-side artifact. A database trigger enforces immutable
+identity fields and one-way transitions. State is random (or, for OAuth 1
+providers, the provider's high-entropy request token),
 necessarily present inside the provider `authorizationUrl` but never returned as
 a separate field or stored raw. It is stored as a SHA-256 hash, bound to
 attempt/organization/customer/provider/purpose by a correlation hash, consumed
@@ -88,6 +99,10 @@ clear it. No poll exposes the URL after authorization begins.
 - Provider callbacks continue through the existing Postiz frontend callback
   page. A matching durable state is dispatched to this contract before the
   legacy Redis flow; unmatched dashboard/public states retain legacy behavior.
+  For two-step attempts that callback deliberately returns
+  `inBetweenSteps: false` with the configured Postify URL; provider-safe options
+  are exposed through the machine projection so Postify, not the Postiz
+  frontend, owns final selection.
 
 Provider access/refresh tokens, authorization code, raw state, PKCE/OAuth
 verifier, instance API keys, and custom credentials never appear in this API.
@@ -98,6 +113,10 @@ and mark success. Deferred PostgreSQL custody triggers independently reject a
 Customer or reconnect/interim/final Integration whose organization, customer,
 or provider differs from the immutable attempt, and reject later Customer or
 Integration identity changes that would break historical custody.
+Before any direct credential/customer upsert or two-step revive, the transaction
+also rejects an existing same-organization provider identity assigned to a
+different non-null Customer. Existing unassigned or exact-customer integrations
+remain recoverable; dashboard/manual integration behavior is unchanged.
 
 A provider exception or unknown transaction acknowledgement after one-time code
 exchange remains truthfully `authenticating` until expiry; the consumed code is
@@ -121,11 +140,15 @@ Apply
 `libraries/nestjs-libraries/src/database/prisma/migrations/20260828000000_postify_connection_attempts/migration.sql`
 and then
 `libraries/nestjs-libraries/src/database/prisma/migrations/20260828010000_connection_attempt_idempotency_and_custody/migration.sql`
+and then
+`libraries/nestjs-libraries/src/database/prisma/migrations/20260828020000_connection_attempt_initialization_custody/migration.sql`
 before serving the routes, then run Prisma generation. The migrations add the
 aggregate, operation reservation/recovery identity, indexes/FKs/checks,
 transition/delete guards, and deferred custody triggers. The second migration
 backfills any pre-correction attempt with a non-reusable `legacy:<attempt UUID>`
-operation identity; it does not rewrite Integration or publication rows.
+operation identity. The third migration truthfully fails any pre-existing
+uninitialized reservation and adds guarded `initializing` activation. None
+rewrites Integration or publication rows.
 
 This is modified AGPL-3.0 Postiz source. Operators who provide network access to
 the modified service must provide the corresponding source under the repository

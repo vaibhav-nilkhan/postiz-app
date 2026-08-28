@@ -16,6 +16,13 @@ const custodyMigrationPath = path.resolve(
 const custodyMigration = fs.existsSync(custodyMigrationPath)
   ? fs.readFileSync(custodyMigrationPath, 'utf8')
   : '';
+const initializationMigrationPath = path.resolve(
+  process.cwd(),
+  'libraries/nestjs-libraries/src/database/prisma/migrations/20260828020000_connection_attempt_initialization_custody/migration.sql'
+);
+const initializationMigration = fs.existsSync(initializationMigrationPath)
+  ? fs.readFileSync(initializationMigrationPath, 'utf8')
+  : '';
 
 describe('connection-attempt migration', () => {
   it('is additive and installs ownership, uniqueness, and transition protection', () => {
@@ -95,5 +102,22 @@ describe('connection-attempt migration', () => {
     ]) {
       expect(custodyMigration).toContain(reference);
     }
+  });
+
+  it('adds a finite initialization lease outcome and guarded activation', () => {
+    expect(initializationMigration).toContain("ADD VALUE 'INITIALIZING'");
+    expect(initializationMigration).toContain(
+      "ADD VALUE 'INITIALIZATION_FAILED'"
+    );
+    expect(initializationMigration).toContain(
+      'ALTER COLUMN "status" SET DEFAULT \'INITIALIZING\''
+    );
+    expect(initializationMigration).toContain(
+      'OLD."status" = \'INITIALIZING\''
+    );
+    expect(initializationMigration).toContain('NEW."status" = \'PENDING\'');
+    expect(initializationMigration).toContain(
+      "OLD.\"status\" = 'INITIALIZING' AND NEW.\"status\" IN ('PENDING', 'FAILED', 'EXPIRED')"
+    );
   });
 });

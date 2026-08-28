@@ -20,6 +20,7 @@ import {
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import {
+  ConnectionAttemptCustodyConflictError,
   ConnectionAttemptRepository,
   ConnectionAttemptWithIntegrations,
   SafeSelectionOption,
@@ -37,7 +38,8 @@ type AuthorizationContext = {
 };
 
 const CALLBACK_TTL_MS = 15 * 60 * 1000;
-const INITIALIZATION_WAIT_ATTEMPTS = 100;
+const INITIALIZATION_LEASE_MS = 60 * 1000;
+const INITIALIZATION_HEARTBEAT_MS = 10 * 1000;
 const OPERATION_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
 const TERMINAL_STATUSES = new Set<ConnectionAttemptStatus>([
   ConnectionAttemptStatus.SUCCEEDED,
@@ -325,45 +327,23 @@ export class ConnectionAttemptService {
     return authorizationUrl ? { ...projection, authorizationUrl } : projection;
   }
 
-  private async waitForInitialization(
-    organizationId: string,
-    externalOperationRef: string,
-    initial: ConnectionAttemptWithIntegrations
-  ) {
-    let attempt = initial;
-    for (
-      let count = 0;
-      count < INITIALIZATION_WAIT_ATTEMPTS &&
-      attempt.status === ConnectionAttemptStatus.PENDING &&
-      !attempt.stateHash;
-      count++
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      attempt = (await this._repository.findByExternalOperation(
-        organizationId,
-        externalOperationRef
-      ))!;
-      if (!attempt) {
-        throw new NotFoundException('Connection attempt not found');
-      }
-    }
-    if (
-      attempt.status === ConnectionAttemptStatus.PENDING &&
-      !attempt.stateHash
-    ) {
-      throw new ConflictException(
-        'Connection attempt authorization is initializing'
-      );
-    }
-    return attempt;
-  }
-
   private async recoverOperation(
     organizationId: string,
     externalOperationRef: string,
     initial: ConnectionAttemptWithIntegrations
   ) {
     let attempt = initial;
+    if (attempt.status === ConnectionAttemptStatus.INITIALIZING) {
+      await this._repository.failStaleInitialization(
+        attempt.id,
+        organizationId,
+        new Date(Date.now() - INITIALIZATION_LEASE_MS)
+      );
+      attempt = (await this._repository.findByExternalOperation(
+        organizationId,
+        externalOperationRef
+      ))!;
+    }
     if (attempt.expiresAt <= new Date()) {
       await this._repository.expire(attempt.id, organizationId);
       attempt = (await this._repository.findByExternalOperation(
@@ -371,12 +351,24 @@ export class ConnectionAttemptService {
         externalOperationRef
       ))!;
     }
-    attempt = await this.waitForInitialization(
-      organizationId,
-      externalOperationRef,
-      attempt
-    );
     return this.operationResponse(attempt);
+  }
+
+  private async initializeWithHeartbeat<T>(
+    attemptId: string,
+    initialize: () => Promise<T>
+  ): Promise<T> {
+    const heartbeat = setInterval(() => {
+      void this._repository
+        .heartbeatInitialization(attemptId)
+        .catch(() => undefined);
+    }, INITIALIZATION_HEARTBEAT_MS);
+    heartbeat.unref();
+    try {
+      return await initialize();
+    } finally {
+      clearInterval(heartbeat);
+    }
   }
 
   async create(organization: Organization, input: CreateConnectionAttemptDto) {
@@ -468,39 +460,61 @@ export class ConnectionAttemptService {
       );
     }
 
-    const generated = await provider.generateAuthUrl();
-    const bound = this.bindState(generated);
-    const stateHash = sha256(bound.state);
-    const identity = {
-      id: reservation.attempt.id,
-      organizationId: organization.id,
-      customerId: input.customerId,
-      provider: input.provider,
-      purpose,
-      stateHash,
-    };
-    const attempt = await this._repository.activate(
-      reservation.attempt.id,
-      stateHash,
-      this.correlation(identity),
-      this.encryptAuthorizationContext({
-        codeVerifier: generated.codeVerifier,
-        authorizationUrl: bound.authorizationUrl,
-      })
-    );
-    if (!attempt) {
+    try {
+      return await this.initializeWithHeartbeat(
+        reservation.attempt.id,
+        async () => {
+          const generated = await provider.generateAuthUrl();
+          const bound = this.bindState(generated);
+          const stateHash = sha256(bound.state);
+          const identity = {
+            id: reservation.attempt.id,
+            organizationId: organization.id,
+            customerId: input.customerId,
+            provider: input.provider,
+            purpose,
+            stateHash,
+          };
+          const attempt = await this._repository.activate(
+            reservation.attempt.id,
+            stateHash,
+            this.correlation(identity),
+            this.encryptAuthorizationContext({
+              codeVerifier: generated.codeVerifier,
+              authorizationUrl: bound.authorizationUrl,
+            })
+          );
+          if (!attempt) {
+            return this.readByExternalOperation(
+              organization.id,
+              input.externalOperationRef
+            );
+          }
+          return {
+            ...this.project(attempt),
+            authorizationUrl: bound.authorizationUrl,
+          };
+        }
+      );
+    } catch {
+      await this._repository.fail(
+        reservation.attempt.id,
+        ConnectionAttemptFailureCode.INITIALIZATION_FAILED,
+        [ConnectionAttemptStatus.INITIALIZING]
+      );
       return this.readByExternalOperation(
         organization.id,
         input.externalOperationRef
       );
     }
-    return {
-      ...this.project(attempt),
-      authorizationUrl: bound.authorizationUrl,
-    };
   }
 
   async read(organizationId: string, id: string) {
+    await this._repository.failStaleInitialization(
+      id,
+      organizationId,
+      new Date(Date.now() - INITIALIZATION_LEASE_MS)
+    );
     await this._repository.expire(id, organizationId);
     const attempt = await this._repository.getOwned(organizationId, id);
     if (!attempt) {
@@ -804,7 +818,14 @@ export class ConnectionAttemptService {
       });
       await this.refreshWorkflow(completed, provider);
       return this.callbackResponse(completed);
-    } catch {
+    } catch (error) {
+      if (error instanceof ConnectionAttemptCustodyConflictError) {
+        return this.failedCallback(
+          claimed,
+          ConnectionAttemptFailureCode.CONFLICT,
+          [ConnectionAttemptStatus.AUTHENTICATING]
+        );
+      }
       return this.uncertainAuthentication(claimed);
     }
   }
@@ -889,7 +910,12 @@ export class ConnectionAttemptService {
       });
       await this.refreshWorkflow(completed, provider);
       return this.project(completed);
-    } catch {
+    } catch (error) {
+      if (error instanceof ConnectionAttemptCustodyConflictError) {
+        await this._repository.fail(id, ConnectionAttemptFailureCode.CONFLICT, [
+          ConnectionAttemptStatus.FINALIZING,
+        ]);
+      }
       return this.read(organizationId, id);
     }
   }

@@ -383,7 +383,7 @@ model ConnectionAttempt {
   stateHash              String?                       @unique @db.Char(64)
   stateCorrelation       String?                       @db.Char(64)
   authorizationContext   String?                       @db.VarChar(8192)
-  status                 ConnectionAttemptStatus       @default(PENDING)
+  status                 ConnectionAttemptStatus       @default(INITIALIZING)
   interimIntegrationId   String?                       @unique
   finalIntegrationId     String?
   selectionMetadata      Json?
@@ -614,6 +614,7 @@ enum ConnectionAttemptPurpose {
 }
 
 enum ConnectionAttemptStatus {
+  INITIALIZING
   PENDING
   AUTHENTICATING
   AWAITING_SELECTION
@@ -624,6 +625,7 @@ enum ConnectionAttemptStatus {
 }
 
 enum ConnectionAttemptFailureCode {
+  INITIALIZATION_FAILED
   ACCESS_DENIED
   EXPIRED
   INVALID_STATE
