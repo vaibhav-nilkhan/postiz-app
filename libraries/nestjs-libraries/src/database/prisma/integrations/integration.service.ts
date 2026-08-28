@@ -11,7 +11,7 @@ import {
   AnalyticsData,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
-import { Integration, Organization } from '@prisma/client';
+import { Integration, Organization, Prisma } from '@prisma/client';
 import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/notifications/notification.service';
 import dayjs from 'dayjs';
 import { timer } from '@gitroom/helpers/utils/timer';
@@ -108,7 +108,12 @@ export class IntegrationService {
     isBetweenSteps = false,
     refresh?: string,
     timezone?: number,
-    customInstanceDetails?: string
+    customInstanceDetails?: string,
+    connectionAttempt?: {
+      customerId: string;
+      rootInternalId?: string;
+      database?: Prisma.TransactionClient;
+    }
   ) {
     const uploadedPicture = picture
       ? picture?.indexOf('imagedelivery.net') > -1
@@ -135,7 +140,8 @@ export class IntegrationService {
       isBetweenSteps,
       refresh,
       timezone,
-      customInstanceDetails
+      customInstanceDetails,
+      connectionAttempt
     );
   }
 
@@ -316,10 +322,11 @@ export class IntegrationService {
       org,
       String(getIntegrationInformation.id)
     );
-    await this._integrationRepository.updateIntegration(id, {
+    await this._integrationRepository.updateIntegration(org, id, {
       picture: getIntegrationInformation.picture,
       internalId: String(getIntegrationInformation.id),
       organizationId: org,
+      providerIdentifier: getIntegration.providerIdentifier,
       name: getIntegrationInformation.name,
       inBetweenSteps: false,
       token: getIntegrationInformation.access_token,

@@ -49,6 +49,8 @@ import { ErrorsService } from '@gitroom/nestjs-libraries/database/prisma/errors/
 import { AdminStatsRepository } from '@gitroom/nestjs-libraries/database/prisma/admin-stats/admin-stats.repository';
 import { AdminStatsService } from '@gitroom/nestjs-libraries/database/prisma/admin-stats/admin-stats.service';
 import { PublicationAttemptService } from '@gitroom/nestjs-libraries/database/prisma/publication-attempt/publication-attempt.service';
+import { ConnectionAttemptRepository } from '@gitroom/nestjs-libraries/database/prisma/connection-attempt/connection-attempt.repository';
+import { ConnectionAttemptService } from '@gitroom/nestjs-libraries/database/prisma/connection-attempt/connection-attempt.service';
 
 @Global()
 @Module({
@@ -103,6 +105,8 @@ import { PublicationAttemptService } from '@gitroom/nestjs-libraries/database/pr
     AdminStatsRepository,
     AdminStatsService,
     PublicationAttemptService,
+    ConnectionAttemptRepository,
+    ConnectionAttemptService,
   ],
   get exports() {
     return this.providers;

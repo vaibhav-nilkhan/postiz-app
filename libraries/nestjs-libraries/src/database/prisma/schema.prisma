@@ -45,6 +45,7 @@ model Organization {
   oauthAuthorizations OAuthAuthorization[]
   publicationRequests PublicationRequest[]
   publicationAttempts PublicationAttempt[]
+  connectionAttempts  ConnectionAttempt[]
 
   @@index([apiKey])
   @@index([streakSince])
@@ -311,42 +312,46 @@ model Customer {
   integrations               Integration[]
   publicationRequestBindings PublicationRequestBinding[]
   publicationAttempts        PublicationAttempt[]
+  connectionAttempts         ConnectionAttempt[]
 
   @@unique([orgId, name, deletedAt])
 }
 
 model Integration {
-  id                         String                      @id @default(cuid())
-  internalId                 String
-  organizationId             String
-  name                       String
-  picture                    String?
-  providerIdentifier         String
-  type                       String
-  token                      String
-  disabled                   Boolean                     @default(false)
-  tokenExpiration            DateTime?
-  refreshToken               String?
-  profile                    String?
-  deletedAt                  DateTime?
-  createdAt                  DateTime                    @default(now())
-  updatedAt                  DateTime?                   @updatedAt
-  inBetweenSteps             Boolean                     @default(false)
-  refreshNeeded              Boolean                     @default(false)
-  postingTimes               String                      @default("[{\"time\":120}, {\"time\":400}, {\"time\":700}]")
-  customInstanceDetails      String?
-  customerId                 String?
-  rootInternalId             String?
-  additionalSettings         String?                     @default("[]")
-  exisingPlugData            ExisingPlugData[]
-  customer                   Customer?                   @relation(fields: [customerId], references: [id])
-  organization               Organization                @relation(fields: [organizationId], references: [id])
-  webhooks                   IntegrationsWebhooks[]
-  orderItems                 OrderItems[]
-  plugs                      Plugs[]
-  posts                      Post[]
-  publicationRequestBindings PublicationRequestBinding[]
-  publicationAttempts        PublicationAttempt[]
+  id                          String                      @id @default(cuid())
+  internalId                  String
+  organizationId              String
+  name                        String
+  picture                     String?
+  providerIdentifier          String
+  type                        String
+  token                       String
+  disabled                    Boolean                     @default(false)
+  tokenExpiration             DateTime?
+  refreshToken                String?
+  profile                     String?
+  deletedAt                   DateTime?
+  createdAt                   DateTime                    @default(now())
+  updatedAt                   DateTime?                   @updatedAt
+  inBetweenSteps              Boolean                     @default(false)
+  refreshNeeded               Boolean                     @default(false)
+  postingTimes                String                      @default("[{\"time\":120}, {\"time\":400}, {\"time\":700}]")
+  customInstanceDetails       String?
+  customerId                  String?
+  rootInternalId              String?
+  additionalSettings          String?                     @default("[]")
+  exisingPlugData             ExisingPlugData[]
+  customer                    Customer?                   @relation(fields: [customerId], references: [id])
+  organization                Organization                @relation(fields: [organizationId], references: [id])
+  webhooks                    IntegrationsWebhooks[]
+  orderItems                  OrderItems[]
+  plugs                       Plugs[]
+  posts                       Post[]
+  publicationRequestBindings  PublicationRequestBinding[]
+  publicationAttempts         PublicationAttempt[]
+  reconnectConnectionAttempts ConnectionAttempt[]         @relation("ConnectionAttemptReconnect")
+  interimConnectionAttempt    ConnectionAttempt?          @relation("ConnectionAttemptInterim")
+  finalConnectionAttempts     ConnectionAttempt[]         @relation("ConnectionAttemptFinal")
 
   @@unique([organizationId, internalId])
   @@index([rootInternalId])
@@ -359,6 +364,48 @@ model Integration {
   @@index([inBetweenSteps])
   @@index([refreshNeeded])
   @@index([disabled])
+}
+
+// A machine-created, organization- and customer-bound provider authorization.
+// Provider credentials remain on Integration; only encrypted transient OAuth
+// context and provider-safe selection metadata are retained here.
+model ConnectionAttempt {
+  id                     String                        @id @default(uuid()) @db.Uuid
+  organizationId         String
+  customerId             String
+  externalWorkspaceRef   String                        @db.VarChar(128)
+  externalActorRef       String?                       @db.VarChar(128)
+  provider               String                        @db.VarChar(64)
+  purpose                ConnectionAttemptPurpose
+  reconnectIntegrationId String?
+  returnTarget           String                        @db.VarChar(64)
+  stateHash              String                        @unique @db.Char(64)
+  stateCorrelation       String                        @db.Char(64)
+  authorizationContext   String?                       @db.VarChar(2048)
+  status                 ConnectionAttemptStatus       @default(PENDING)
+  interimIntegrationId   String?                       @unique
+  finalIntegrationId     String?
+  selectionMetadata      Json?
+  selectedOptionId       String?                       @db.VarChar(64)
+  expiresAt              DateTime
+  stateConsumedAt        DateTime?
+  completedAt            DateTime?
+  failedAt               DateTime?
+  failureCode            ConnectionAttemptFailureCode?
+  createdAt              DateTime                      @default(now())
+  updatedAt              DateTime                      @updatedAt
+  organization           Organization                  @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  customer               Customer                      @relation(fields: [customerId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  reconnectIntegration   Integration?                  @relation("ConnectionAttemptReconnect", fields: [reconnectIntegrationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  interimIntegration     Integration?                  @relation("ConnectionAttemptInterim", fields: [interimIntegrationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  finalIntegration       Integration?                  @relation("ConnectionAttemptFinal", fields: [finalIntegrationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, externalWorkspaceRef])
+  @@index([customerId])
+  @@index([reconnectIntegrationId])
+  @@index([finalIntegrationId])
+  @@index([status, expiresAt])
 }
 
 model Signatures {
@@ -557,6 +604,32 @@ enum PublicationAttemptEventType {
   PROVIDER_REPORTED_SUCCESS
   EXPLICIT_FAILURE
   UNKNOWN
+}
+
+enum ConnectionAttemptPurpose {
+  CONNECT
+  REAUTHORIZE
+}
+
+enum ConnectionAttemptStatus {
+  PENDING
+  AUTHENTICATING
+  AWAITING_SELECTION
+  FINALIZING
+  SUCCEEDED
+  FAILED
+  EXPIRED
+}
+
+enum ConnectionAttemptFailureCode {
+  ACCESS_DENIED
+  EXPIRED
+  INVALID_STATE
+  PROVIDER_MISMATCH
+  AUTHENTICATION_FAILED
+  ACCOUNT_MISMATCH
+  SELECTION_FAILED
+  CONFLICT
 }
 
 model Notifications {

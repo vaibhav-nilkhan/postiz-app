@@ -6,8 +6,8 @@ export class ConnectIntegrationDto {
   state: string;
 
   @IsString()
-  @IsDefined()
-  code: string;
+  @IsOptional()
+  code?: string;
 
   @IsString()
   @IsDefined()
@@ -16,4 +16,8 @@ export class ConnectIntegrationDto {
   @IsString()
   @IsOptional()
   refresh?: string;
+
+  @IsString()
+  @IsOptional()
+  error?: string;
 }

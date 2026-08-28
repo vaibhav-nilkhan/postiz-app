@@ -1,7 +1,7 @@
 import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { Injectable } from '@nestjs/common';
 import dayjs from 'dayjs';
-import { Integration } from '@prisma/client';
+import { Integration, Prisma } from '@prisma/client';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { IntegrationTimeDto } from '@gitroom/nestjs-libraries/dtos/integrations/integration.time.dto';
 import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
@@ -142,7 +142,29 @@ export class IntegrationRepository {
     });
   }
 
-  async updateIntegration(id: string, params: Partial<Integration>) {
+  async updateIntegration(
+    org: string,
+    id: string,
+    params: Partial<Integration>
+  ) {
+    if (params.organizationId && params.organizationId !== org) {
+      throw new Error('Integration organization mismatch');
+    }
+
+    const target = await this._integration.model.integration.findFirst({
+      where: { id, organizationId: org },
+      select: { id: true, providerIdentifier: true },
+    });
+    if (!target) {
+      throw new Error('Integration not found in organization');
+    }
+    if (
+      params.providerIdentifier &&
+      params.providerIdentifier !== target.providerIdentifier
+    ) {
+      throw new Error('Integration provider mismatch');
+    }
+
     if (
       params.picture &&
       (params.picture.indexOf(process.env.CLOUDFLARE_BUCKET_URL!) === -1 ||
@@ -154,16 +176,21 @@ export class IntegrationRepository {
     const existing = await this._integration.model.integration.findUnique({
       where: {
         organizationId_internalId: {
-          organizationId: params.organizationId!,
+          organizationId: org,
           internalId: params.internalId,
         },
       },
     });
 
+    if (existing && existing.providerIdentifier !== target.providerIdentifier) {
+      throw new Error('Integration provider mismatch');
+    }
+
     if (existing) {
       await this._posts.model.post.updateMany({
         where: {
           integrationId: id,
+          organizationId: org,
         },
         data: {
           deletedAt: new Date(),
@@ -173,6 +200,7 @@ export class IntegrationRepository {
       await this._integration.model.integration.update({
         where: {
           id,
+          organizationId: org,
         },
         data: {
           internalId: `deleted_${params.internalId}_${makeId(10)}`,
@@ -184,6 +212,7 @@ export class IntegrationRepository {
     return this._integration.model.integration.update({
       where: {
         ...(existing ? { id: existing.id } : { id }),
+        organizationId: org,
       },
       data: {
         ...params,
@@ -224,13 +253,23 @@ export class IntegrationRepository {
     provider: string,
     token: string,
     refreshToken = '',
-    expiresIn = 999999999,
+    expiresIn?: number,
     username?: string,
     isBetweenSteps = false,
     refresh?: string,
     timezone?: number,
-    customInstanceDetails?: string
+    customInstanceDetails?: string,
+    connectionAttempt?: {
+      customerId: string;
+      rootInternalId?: string;
+      database?: Prisma.TransactionClient;
+    }
   ) {
+    const effectiveExpiresIn =
+      expiresIn === undefined && !connectionAttempt ? 999999999 : expiresIn;
+    const integrations =
+      connectionAttempt?.database?.integration ||
+      this._integration.model.integration;
     const postTimes = timezone
       ? {
           postingTimes: JSON.stringify([
@@ -240,7 +279,20 @@ export class IntegrationRepository {
           ]),
         }
       : {};
-    const upsert = await this._integration.model.integration.upsert({
+    const existing = await integrations.findUnique({
+      where: {
+        organizationId_internalId: {
+          internalId,
+          organizationId: org,
+        },
+      },
+      select: { id: true, providerIdentifier: true },
+    });
+    if (existing && existing.providerIdentifier !== provider) {
+      throw new Error('Integration provider mismatch');
+    }
+
+    const upsert = await integrations.upsert({
       where: {
         organizationId_internalId: {
           internalId,
@@ -256,14 +308,19 @@ export class IntegrationRepository {
         ...(picture ? { picture } : {}),
         inBetweenSteps: isBetweenSteps,
         refreshToken,
-        ...(expiresIn
-          ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
+        ...(effectiveExpiresIn
+          ? {
+              tokenExpiration: new Date(Date.now() + effectiveExpiresIn * 1000),
+            }
           : {}),
         internalId,
         ...postTimes,
         organizationId: org,
         refreshNeeded: false,
-        rootInternalId: internalId,
+        rootInternalId: connectionAttempt?.rootInternalId || internalId,
+        ...(connectionAttempt
+          ? { customerId: connectionAttempt.customerId }
+          : {}),
         ...(customInstanceDetails ? { customInstanceDetails } : {}),
         additionalSettings: additionalSettings
           ? JSON.stringify(additionalSettings)
@@ -285,20 +342,30 @@ export class IntegrationRepository {
         providerIdentifier: provider,
         token,
         refreshToken,
-        ...(expiresIn
-          ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
+        ...(effectiveExpiresIn
+          ? {
+              tokenExpiration: new Date(Date.now() + effectiveExpiresIn * 1000),
+            }
+          : connectionAttempt
+          ? { tokenExpiration: null }
           : {}),
         internalId,
         organizationId: org,
         deletedAt: null,
         refreshNeeded: false,
+        ...(connectionAttempt
+          ? {
+              customerId: connectionAttempt.customerId,
+              rootInternalId: connectionAttempt.rootInternalId || internalId,
+            }
+          : {}),
       },
     });
 
     if (oneTimeToken) {
       const rootId =
         (
-          await this._integration.model.integration.findFirst({
+          await integrations.findFirst({
             where: {
               organizationId: org,
               internalId: internalId,
@@ -306,19 +373,24 @@ export class IntegrationRepository {
           })
         )?.rootInternalId || internalId;
 
-      await this._integration.model.integration.updateMany({
+      await integrations.updateMany({
         where: {
           id: {
             not: upsert.id,
           },
+          organizationId: org,
           rootInternalId: rootId,
         },
         data: {
           token,
           refreshToken,
           refreshNeeded: false,
-          ...(expiresIn
-            ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
+          ...(effectiveExpiresIn
+            ? {
+                tokenExpiration: new Date(
+                  Date.now() + effectiveExpiresIn * 1000
+                ),
+              }
             : {}),
         },
       });
@@ -452,7 +524,17 @@ export class IntegrationRepository {
     });
   }
 
-  updateIntegrationGroup(org: string, id: string, group: string) {
+  async updateIntegrationGroup(org: string, id: string, group: string) {
+    if (group) {
+      const customer = await this._customers.model.customer.findFirst({
+        where: { id: group, orgId: org, deletedAt: null },
+        select: { id: true },
+      });
+      if (!customer) {
+        throw new Error('Customer not found in organization');
+      }
+    }
+
     return this._integration.model.integration.update({
       where: {
         id,
