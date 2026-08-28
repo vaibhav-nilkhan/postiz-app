@@ -88,23 +88,73 @@ export class ConnectionAttemptRepository {
     });
   }
 
-  create(input: {
+  async reserve(input: {
     id: string;
     organizationId: string;
     customerId: string;
+    externalOperationRef: string;
     externalWorkspaceRef: string;
     externalActorRef?: string;
     provider: string;
     purpose: ConnectionAttemptPurpose;
     reconnectIntegrationId?: string;
     returnTarget: string;
-    stateHash: string;
-    stateCorrelation: string;
-    authorizationContext: string;
     expiresAt: Date;
   }) {
-    return this._prisma.connectionAttempt.create({
-      data: input,
+    try {
+      const attempt = await this._prisma.connectionAttempt.create({
+        data: input,
+        include: attemptInclude,
+      });
+      return { attempt, created: true as const };
+    } catch (error) {
+      const attempt = await this.findByExternalOperation(
+        input.organizationId,
+        input.externalOperationRef
+      );
+      if (!attempt) {
+        throw error;
+      }
+      return { attempt, created: false as const };
+    }
+  }
+
+  findByExternalOperation(
+    organizationId: string,
+    externalOperationRef: string
+  ) {
+    return this._prisma.connectionAttempt.findUnique({
+      where: {
+        organizationId_externalOperationRef: {
+          organizationId,
+          externalOperationRef,
+        },
+      },
+      include: attemptInclude,
+    });
+  }
+
+  async activate(
+    id: string,
+    stateHash: string,
+    stateCorrelation: string,
+    authorizationContext: string
+  ) {
+    const activated = await this._prisma.connectionAttempt.updateMany({
+      where: {
+        id,
+        status: ConnectionAttemptStatus.PENDING,
+        stateHash: null,
+        stateCorrelation: null,
+        authorizationContext: null,
+      },
+      data: { stateHash, stateCorrelation, authorizationContext },
+    });
+    if (activated.count !== 1) {
+      return null;
+    }
+    return this._prisma.connectionAttempt.findUniqueOrThrow({
+      where: { id },
       include: attemptInclude,
     });
   }
@@ -116,7 +166,7 @@ export class ConnectionAttemptRepository {
     });
   }
 
-  async claimState(id: string, now: Date) {
+  async claimState(id: string, now: Date, authorizationContext: string | null) {
     const claimed = await this._prisma.connectionAttempt.updateMany({
       where: {
         id,
@@ -127,6 +177,7 @@ export class ConnectionAttemptRepository {
       data: {
         status: ConnectionAttemptStatus.AUTHENTICATING,
         stateConsumedAt: now,
+        authorizationContext,
       },
     });
     if (claimed.count !== 1) {
@@ -135,6 +186,17 @@ export class ConnectionAttemptRepository {
     return this._prisma.connectionAttempt.findUniqueOrThrow({
       where: { id },
       include: attemptInclude,
+    });
+  }
+
+  clearAuthorizationContext(id: string) {
+    return this._prisma.connectionAttempt.updateMany({
+      where: {
+        id,
+        status: ConnectionAttemptStatus.AUTHENTICATING,
+        authorizationContext: { not: null },
+      },
+      data: { authorizationContext: null },
     });
   }
 
@@ -319,7 +381,7 @@ export class ConnectionAttemptRepository {
       async (database) => {
         const attempt = await database.connectionAttempt.findFirst({
           where: { id, organizationId },
-          include: { interimIntegration: true },
+          include: attemptInclude,
         });
         if (!attempt) {
           return null;
@@ -334,10 +396,26 @@ export class ConnectionAttemptRepository {
           throw new Error('Invalid connection attempt selection');
         }
         if (
+          attempt.status === ConnectionAttemptStatus.SUCCEEDED &&
+          attempt.selectedOptionId === selectionId
+        ) {
+          return {
+            expired: false as const,
+            completed: true as const,
+            attempt,
+            option,
+          };
+        }
+        if (
           attempt.status === ConnectionAttemptStatus.FINALIZING &&
           attempt.selectedOptionId === selectionId
         ) {
-          return { expired: false as const, attempt, option };
+          return {
+            expired: false as const,
+            completed: false as const,
+            attempt,
+            option,
+          };
         }
         if (attempt.status !== ConnectionAttemptStatus.AWAITING_SELECTION) {
           throw new Error('Connection attempt is not awaiting selection');
@@ -356,7 +434,12 @@ export class ConnectionAttemptRepository {
         if (claimed.count !== 1) {
           throw new Error('Connection attempt selection conflict');
         }
-        return { expired: false as const, attempt, option };
+        return {
+          expired: false as const,
+          completed: false as const,
+          attempt,
+          option,
+        };
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
     );

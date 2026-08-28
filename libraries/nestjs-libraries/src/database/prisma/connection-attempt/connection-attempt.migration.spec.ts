@@ -9,6 +9,13 @@ const migration = fs.readFileSync(
   ),
   'utf8'
 );
+const custodyMigrationPath = path.resolve(
+  process.cwd(),
+  'libraries/nestjs-libraries/src/database/prisma/migrations/20260828010000_connection_attempt_idempotency_and_custody/migration.sql'
+);
+const custodyMigration = fs.existsSync(custodyMigrationPath)
+  ? fs.readFileSync(custodyMigrationPath, 'utf8')
+  : '';
 
 describe('connection-attempt migration', () => {
   it('is additive and installs ownership, uniqueness, and transition protection', () => {
@@ -45,5 +52,48 @@ describe('connection-attempt migration', () => {
     }
     expect(migration).toContain('ConnectionAttempt_terminal_shape');
     expect(migration).toContain('ConnectionAttempt_purpose_shape');
+  });
+
+  it('adds immutable organization-scoped external operation recovery', () => {
+    expect(custodyMigration).toContain('"externalOperationRef" VARCHAR(128)');
+    expect(custodyMigration).toContain(
+      'ConnectionAttempt_organizationId_externalOperationRef_key'
+    );
+    expect(custodyMigration).toContain(
+      'NEW."externalOperationRef" IS DISTINCT FROM OLD."externalOperationRef"'
+    );
+    expect(custodyMigration).toContain(
+      'ALTER COLUMN "stateHash" DROP NOT NULL'
+    );
+    expect(custodyMigration).toContain(
+      'ALTER COLUMN "stateCorrelation" DROP NOT NULL'
+    );
+    expect(custodyMigration).toContain('TYPE VARCHAR(8192)');
+  });
+
+  it('installs deferred exact customer and Integration custody controls', () => {
+    expect(custodyMigration).toContain('guard_connection_attempt_custody');
+    expect(custodyMigration).toContain(
+      'guard_connection_attempt_integration_custody'
+    );
+    expect(custodyMigration).toContain(
+      'guard_connection_attempt_customer_custody'
+    );
+    expect(custodyMigration).toContain('CREATE CONSTRAINT TRIGGER');
+    expect(custodyMigration).toContain('DEFERRABLE INITIALLY DEFERRED');
+    for (const identity of [
+      '"organizationId" = NEW."organizationId"',
+      '"customerId" = NEW."customerId"',
+      '"providerIdentifier" = NEW."provider"',
+    ]) {
+      expect(custodyMigration).toContain(identity);
+    }
+    for (const reference of [
+      'reconnect integration custody mismatch',
+      'interim integration custody mismatch',
+      'final integration custody mismatch',
+    ]) {
+      expect(custodyMigration).toContain(reference);
+    }
   });
 });

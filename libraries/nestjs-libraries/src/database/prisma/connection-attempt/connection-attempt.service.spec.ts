@@ -81,6 +81,10 @@ class MemoryRepository {
   customers = new Set(['org-1:customer-1']);
   reconnects = new Map<string, any>();
   completeAuthenticationCalls = 0;
+  completeAuthenticationError?: Error;
+  completeAuthenticationErrorAfterCommit?: Error;
+  completeSelectionError?: Error;
+  completeSelectionErrorAfterCommit?: Error;
 
   async findCustomer(organizationId: string, customerId: string) {
     return this.customers.has(`${organizationId}:${customerId}`)
@@ -96,9 +100,20 @@ class MemoryRepository {
     return integration?.organizationId === organizationId ? integration : null;
   }
 
-  async create(input: any) {
+  async reserve(input: any) {
+    const existing = [...this.attempts.values()].find(
+      (attempt) =>
+        attempt.organizationId === input.organizationId &&
+        attempt.externalOperationRef === input.externalOperationRef
+    );
+    if (existing) {
+      return { attempt: existing, created: false };
+    }
     const attempt = {
       ...input,
+      stateHash: null,
+      stateCorrelation: null,
+      authorizationContext: null,
       externalActorRef: input.externalActorRef || null,
       reconnectIntegrationId: input.reconnectIntegrationId || null,
       reconnectIntegration: input.reconnectIntegrationId
@@ -119,6 +134,35 @@ class MemoryRepository {
       updatedAt: new Date(),
     };
     this.attempts.set(attempt.id, attempt);
+    return { attempt, created: true };
+  }
+
+  async findByExternalOperation(
+    organizationId: string,
+    externalOperationRef: string
+  ) {
+    return (
+      [...this.attempts.values()].find(
+        (attempt) =>
+          attempt.organizationId === organizationId &&
+          attempt.externalOperationRef === externalOperationRef
+      ) || null
+    );
+  }
+
+  async activate(
+    id: string,
+    stateHash: string,
+    stateCorrelation: string,
+    authorizationContext: string
+  ) {
+    const attempt = this.attempts.get(id);
+    if (!attempt || attempt.stateHash) return null;
+    Object.assign(attempt, {
+      stateHash,
+      stateCorrelation,
+      authorizationContext,
+    });
     return attempt;
   }
 
@@ -130,7 +174,7 @@ class MemoryRepository {
     );
   }
 
-  async claimState(id: string, now: Date) {
+  async claimState(id: string, now: Date, authorizationContext: string | null) {
     const attempt = this.attempts.get(id);
     if (
       !attempt ||
@@ -142,12 +186,28 @@ class MemoryRepository {
     }
     attempt.status = ConnectionAttemptStatus.AUTHENTICATING;
     attempt.stateConsumedAt = now;
+    attempt.authorizationContext = authorizationContext;
     return attempt;
   }
 
-  async fail(id: string, code: ConnectionAttemptFailureCode) {
+  async clearAuthorizationContext(id: string) {
     const attempt = this.attempts.get(id);
-    if (!attempt || attempt.status === ConnectionAttemptStatus.SUCCEEDED)
+    if (attempt?.status === ConnectionAttemptStatus.AUTHENTICATING) {
+      attempt.authorizationContext = null;
+    }
+  }
+
+  async fail(
+    id: string,
+    code: ConnectionAttemptFailureCode,
+    allowedStatuses?: ConnectionAttemptStatus[]
+  ) {
+    const attempt = this.attempts.get(id);
+    if (
+      !attempt ||
+      attempt.status === ConnectionAttemptStatus.SUCCEEDED ||
+      (allowedStatuses && !allowedStatuses.includes(attempt.status))
+    )
       return;
     attempt.status = ConnectionAttemptStatus.FAILED;
     attempt.failureCode = code;
@@ -171,6 +231,7 @@ class MemoryRepository {
       attempt.failureCode = ConnectionAttemptFailureCode.EXPIRED;
       attempt.failedAt = new Date();
       attempt.stateConsumedAt ||= new Date();
+      attempt.authorizationContext = null;
     }
   }
 
@@ -181,6 +242,9 @@ class MemoryRepository {
 
   async completeAuthentication(input: any) {
     this.completeAuthenticationCalls++;
+    if (this.completeAuthenticationError) {
+      throw this.completeAuthenticationError;
+    }
     const attempt = this.attempts.get(input.attemptId);
     if (input.selectionOptions) {
       attempt.status = ConnectionAttemptStatus.AWAITING_SELECTION;
@@ -203,6 +267,9 @@ class MemoryRepository {
       attempt.completedAt = new Date();
     }
     attempt.authorizationContext = null;
+    if (this.completeAuthenticationErrorAfterCommit) {
+      throw this.completeAuthenticationErrorAfterCommit;
+    }
     return attempt;
   }
 
@@ -220,6 +287,15 @@ class MemoryRepository {
     if (!option || !attempt.interimIntegration)
       throw new Error('bad selection');
     if (
+      attempt.status === ConnectionAttemptStatus.SUCCEEDED &&
+      attempt.selectedOptionId === selectionId
+    ) {
+      const option = attempt.selectionMetadata?.find(
+        (value: any) => value.id === selectionId
+      );
+      return { expired: false, completed: true, attempt, option };
+    }
+    if (
       attempt.status !== ConnectionAttemptStatus.AWAITING_SELECTION &&
       !(
         attempt.status === ConnectionAttemptStatus.FINALIZING &&
@@ -230,10 +306,13 @@ class MemoryRepository {
     }
     attempt.status = ConnectionAttemptStatus.FINALIZING;
     attempt.selectedOptionId = selectionId;
-    return { expired: false, attempt, option };
+    return { expired: false, completed: false, attempt, option };
   }
 
   async completeSelection(input: any) {
+    if (this.completeSelectionError) {
+      throw this.completeSelectionError;
+    }
     const attempt = this.attempts.get(input.attemptId);
     attempt.status = ConnectionAttemptStatus.SUCCEEDED;
     attempt.finalIntegrationId = 'integration-selected';
@@ -242,6 +321,9 @@ class MemoryRepository {
       providerIdentifier: attempt.provider,
     };
     attempt.completedAt = new Date();
+    if (this.completeSelectionErrorAfterCommit) {
+      throw this.completeSelectionErrorAfterCommit;
+    }
     return attempt;
   }
 }
@@ -253,7 +335,11 @@ function harness(
   const manager = {
     getAllowedSocialsIntegrations: () => ['direct', 'two-step'],
     getSocialIntegration: (name: string) =>
-      name === 'two-step' ? twoStepProvider : provider,
+      name === provider.identifier
+        ? provider
+        : name === 'two-step'
+        ? twoStepProvider
+        : directProvider,
   };
   const refresh = { startRefreshWorkflow: vi.fn(async () => undefined) };
   const service = new ConnectionAttemptService(
@@ -269,6 +355,7 @@ const createBody = {
   provider: 'direct',
   purpose: 'connect' as const,
   returnTarget: 'postify',
+  externalOperationRef: 'connect-operation-1',
   externalWorkspaceRef: 'workspace-1',
   externalActorRef: 'actor-1',
 };
@@ -291,6 +378,78 @@ describe('ConnectionAttemptService', () => {
       postify: 'https://postify.test/settings/social/callback',
     });
     vi.clearAllMocks();
+  });
+
+  it('replays a serial create with the exact attempt and authorization URL', async () => {
+    const { service, repository } = harness();
+    const first = await service.create({ id: 'org-1' } as never, createBody);
+    const replay = await service.create({ id: 'org-1' } as never, createBody);
+
+    expect(replay).toEqual(first);
+    expect(directProvider.generateAuthUrl).toHaveBeenCalledOnce();
+    expect(repository.attempts.size).toBe(1);
+    expect(JSON.stringify([...repository.attempts.values()])).not.toContain(
+      first.authorizationUrl
+    );
+  });
+
+  it('recovers a lost create response by external operation without regeneration', async () => {
+    const { service } = harness();
+    const created = await service.create({ id: 'org-1' } as never, createBody);
+
+    const recovered = await service.readByExternalOperation(
+      'org-1',
+      createBody.externalOperationRef
+    );
+    expect(recovered).toEqual(created);
+    expect(directProvider.generateAuthUrl).toHaveBeenCalledOnce();
+    await expect(
+      service.readByExternalOperation('org-2', createBody.externalOperationRef)
+    ).rejects.toThrow('not found');
+  });
+
+  it('serializes concurrent creates to one generated authorization URL', async () => {
+    const { service, repository } = harness();
+    const [first, second] = await Promise.all([
+      service.create({ id: 'org-1' } as never, createBody),
+      service.create({ id: 'org-1' } as never, createBody),
+    ]);
+
+    expect(second).toEqual(first);
+    expect(directProvider.generateAuthUrl).toHaveBeenCalledOnce();
+    expect(repository.attempts.size).toBe(1);
+  });
+
+  it('rejects reuse of an external operation with mismatched identity', async () => {
+    const { service } = harness();
+    await service.create({ id: 'org-1' } as never, createBody);
+
+    for (const mismatch of [
+      { customerId: 'different-customer' },
+      { provider: 'two-step' },
+      {
+        purpose: 'reauthorize' as const,
+        reconnectIntegrationId: 'different-integration',
+      },
+      { returnTarget: 'different-return-target' },
+      { externalActorRef: 'different-actor' },
+      { externalWorkspaceRef: 'different-workspace' },
+    ]) {
+      await expect(
+        service.create({ id: 'org-1' } as never, {
+          ...createBody,
+          ...mismatch,
+        })
+      ).rejects.toThrow('identity conflict');
+    }
+    expect(directProvider.generateAuthUrl).toHaveBeenCalledOnce();
+    await expect(
+      service.create({ id: 'org-1' } as never, {
+        ...createBody,
+        externalOperationRef: 'bad/reference',
+      })
+    ).rejects.toThrow('operation reference is invalid');
+    expect(directProvider.generateAuthUrl).toHaveBeenCalledOnce();
   });
 
   it('completes a direct provider and exposes no credentials', async () => {
@@ -321,6 +480,127 @@ describe('ConnectionAttemptService', () => {
     ]) {
       expect(publicJson).not.toContain(secret);
     }
+    const recovery = await service.readByExternalOperation(
+      'org-1',
+      createBody.externalOperationRef
+    );
+    expect(recovery).not.toHaveProperty('authorizationUrl');
+    expect(repository.attempts.get(created.id).authorizationContext).toBeNull();
+  });
+
+  it('keeps uncertain provider exchange and storage outcomes authenticating', async () => {
+    for (const uncertainty of ['provider', 'storage'] as const) {
+      const provider = {
+        ...directProvider,
+        authenticate:
+          uncertainty === 'provider'
+            ? vi.fn(async () => {
+                throw new Error('provider timeout');
+              })
+            : directProvider.authenticate,
+      };
+      const { service, repository } = harness(provider);
+      if (uncertainty === 'storage') {
+        repository.completeAuthenticationError = new Error(
+          'unknown commit outcome'
+        );
+      }
+      const { created, state } = await createdAttempt(service, {
+        ...createBody,
+        externalOperationRef: `uncertain-${uncertainty}`,
+      });
+
+      const callback = await service.tryHandleCallback('direct', {
+        state,
+        code: 'one-time-code',
+        timezone: '0',
+      });
+      expect(callback?.postifyConnectionAttempt).toMatchObject({
+        status: 'authenticating',
+      });
+      expect(callback?.postifyConnectionAttempt).not.toHaveProperty(
+        'failureCode'
+      );
+      expect(
+        repository.attempts.get(created.id).authorizationContext
+      ).toBeNull();
+      await expect(
+        service.tryHandleCallback('direct', {
+          state,
+          code: 'must-not-replay',
+          timezone: '0',
+        })
+      ).rejects.toThrow('already used');
+      expect(provider.authenticate).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('fails a definitive malformed authentication response', async () => {
+    const provider = {
+      ...directProvider,
+      authenticate: vi.fn(async () => ({ error: 'invalid_grant' })),
+    };
+    const { service } = harness(provider);
+    const { state } = await createdAttempt(service, {
+      ...createBody,
+      externalOperationRef: 'definitive-auth-failure',
+    });
+
+    const callback = await service.tryHandleCallback('direct', {
+      state,
+      code: 'code',
+      timezone: '0',
+    });
+    expect(callback?.postifyConnectionAttempt).toMatchObject({
+      status: 'failed',
+      failureCode: 'authentication_failed',
+    });
+  });
+
+  it('projects a committed authentication after an unknown commit acknowledgement', async () => {
+    const { service, repository } = harness();
+    repository.completeAuthenticationErrorAfterCommit = new Error(
+      'commit acknowledgement lost'
+    );
+    const { state } = await createdAttempt(service, {
+      ...createBody,
+      externalOperationRef: 'committed-authentication',
+    });
+
+    const callback = await service.tryHandleCallback('direct', {
+      state,
+      code: 'one-time-code',
+      timezone: '0',
+    });
+    expect(callback?.postifyConnectionAttempt).toMatchObject({
+      status: 'succeeded',
+      finalIntegrationId: 'integration-final',
+    });
+  });
+
+  it('keeps uncertain two-step account enumeration authenticating', async () => {
+    const provider = {
+      ...twoStepProvider,
+      pages: vi.fn(async () => {
+        throw new Error('provider page read timeout');
+      }),
+    };
+    const { service } = harness(provider);
+    const { state } = await createdAttempt(service, {
+      ...createBody,
+      provider: 'two-step',
+      externalOperationRef: 'uncertain-account-enumeration',
+    });
+
+    const callback = await service.tryHandleCallback('two-step', {
+      state,
+      code: 'one-time-code',
+      timezone: '0',
+    });
+    expect(callback?.postifyConnectionAttempt.status).toBe('authenticating');
+    expect(callback?.postifyConnectionAttempt).not.toHaveProperty(
+      'failureCode'
+    );
   });
 
   it('durably pauses and resumes a two-step provider with safe metadata', async () => {
@@ -368,6 +648,139 @@ describe('ConnectionAttemptService', () => {
       'provider-access-token',
       expect.objectContaining({ id: 'page-1', page: 'page-1' })
     );
+  });
+
+  it('keeps uncertain selection reads/final writes resumable for the same selection', async () => {
+    for (const uncertainty of ['provider-read', 'storage'] as const) {
+      const provider = {
+        ...twoStepProvider,
+        fetchPageInformation: vi.fn(async (_token: string, selection: any) => ({
+          id: selection.page,
+          name: 'Safe page',
+          access_token: 'selected-page-token',
+          username: 'safe-page',
+        })),
+      };
+      const { service, repository } = harness(provider);
+      const { created, state } = await createdAttempt(service, {
+        ...createBody,
+        provider: 'two-step',
+        externalOperationRef: `uncertain-${uncertainty}`,
+      });
+      await service.tryHandleCallback('two-step', {
+        state,
+        code: 'authorization-code',
+        timezone: '0',
+      });
+      const pending = await service.read('org-1', created.id);
+      const selectionId = pending.metadata!.selection[0].id;
+      if (uncertainty === 'provider-read') {
+        provider.fetchPageInformation.mockRejectedValueOnce(
+          new Error('provider read timeout')
+        );
+      } else {
+        repository.completeSelectionError = new Error('unknown commit outcome');
+      }
+
+      const uncertain = await service.finalizeSelection(
+        'org-1',
+        created.id,
+        selectionId
+      );
+      expect(uncertain.status).toBe('finalizing');
+      expect(uncertain).not.toHaveProperty('failureCode');
+
+      repository.completeSelectionError = undefined;
+      const recovered = await service.finalizeSelection(
+        'org-1',
+        created.id,
+        selectionId
+      );
+      expect(recovered.status).toBe('succeeded');
+      const providerReads = provider.fetchPageInformation.mock.calls.length;
+      const replay = await service.finalizeSelection(
+        'org-1',
+        created.id,
+        selectionId
+      );
+      expect(replay).toEqual(recovered);
+      expect(provider.fetchPageInformation).toHaveBeenCalledTimes(
+        providerReads
+      );
+      await expect(
+        service.finalizeSelection('org-1', created.id, 'f'.repeat(32))
+      ).rejects.toThrow('selection is invalid');
+    }
+  });
+
+  it('fails a definitive mismatched selection response', async () => {
+    const provider = {
+      ...twoStepProvider,
+      fetchPageInformation: vi.fn(async () => ({
+        id: 'different-page',
+        name: 'Wrong page',
+        access_token: 'wrong-page-token',
+        username: 'wrong-page',
+      })),
+    };
+    const { service } = harness(provider);
+    const { created, state } = await createdAttempt(service, {
+      ...createBody,
+      provider: 'two-step',
+      externalOperationRef: 'definitive-selection-failure',
+    });
+    await service.tryHandleCallback('two-step', {
+      state,
+      code: 'authorization-code',
+      timezone: '0',
+    });
+    const pending = await service.read('org-1', created.id);
+    const result = await service.finalizeSelection(
+      'org-1',
+      created.id,
+      pending.metadata!.selection[0].id
+    );
+    expect(result).toMatchObject({
+      status: 'failed',
+      failureCode: 'selection_failed',
+    });
+  });
+
+  it('projects a committed selection after an unknown commit acknowledgement', async () => {
+    const provider = {
+      ...twoStepProvider,
+      fetchPageInformation: vi.fn(async (_token: string, selection: any) => ({
+        id: selection.page,
+        name: 'Safe page',
+        access_token: 'selected-page-token',
+        username: 'safe-page',
+      })),
+    };
+    const { service, repository } = harness(provider);
+    const { created, state } = await createdAttempt(service, {
+      ...createBody,
+      provider: 'two-step',
+      externalOperationRef: 'committed-selection',
+    });
+    await service.tryHandleCallback('two-step', {
+      state,
+      code: 'authorization-code',
+      timezone: '0',
+    });
+    const pending = await service.read('org-1', created.id);
+    repository.completeSelectionErrorAfterCommit = new Error(
+      'commit acknowledgement lost'
+    );
+
+    const completed = await service.finalizeSelection(
+      'org-1',
+      created.id,
+      pending.metadata!.selection[0].id
+    );
+    expect(completed).toMatchObject({
+      status: 'succeeded',
+      finalIntegrationId: 'integration-selected',
+    });
   });
 
   it('records denial without calling a provider', async () => {

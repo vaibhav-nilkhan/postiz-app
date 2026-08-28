@@ -373,15 +373,16 @@ model ConnectionAttempt {
   id                     String                        @id @default(uuid()) @db.Uuid
   organizationId         String
   customerId             String
+  externalOperationRef   String                        @db.VarChar(128)
   externalWorkspaceRef   String                        @db.VarChar(128)
   externalActorRef       String?                       @db.VarChar(128)
   provider               String                        @db.VarChar(64)
   purpose                ConnectionAttemptPurpose
   reconnectIntegrationId String?
   returnTarget           String                        @db.VarChar(64)
-  stateHash              String                        @unique @db.Char(64)
-  stateCorrelation       String                        @db.Char(64)
-  authorizationContext   String?                       @db.VarChar(2048)
+  stateHash              String?                       @unique @db.Char(64)
+  stateCorrelation       String?                       @db.Char(64)
+  authorizationContext   String?                       @db.VarChar(8192)
   status                 ConnectionAttemptStatus       @default(PENDING)
   interimIntegrationId   String?                       @unique
   finalIntegrationId     String?
@@ -400,6 +401,7 @@ model ConnectionAttempt {
   interimIntegration     Integration?                  @relation("ConnectionAttemptInterim", fields: [interimIntegrationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   finalIntegration       Integration?                  @relation("ConnectionAttemptFinal", fields: [finalIntegrationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
 
+  @@unique([organizationId, externalOperationRef])
   @@index([organizationId, createdAt])
   @@index([organizationId, externalWorkspaceRef])
   @@index([customerId])

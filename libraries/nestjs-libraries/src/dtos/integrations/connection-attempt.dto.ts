@@ -10,6 +10,7 @@ import {
 } from 'class-validator';
 
 const BOUNDED_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]*$/;
+const OPERATION_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:@-]*$/;
 
 export class CreateConnectionAttemptDto {
   @IsString()
@@ -38,6 +39,12 @@ export class CreateConnectionAttemptDto {
   @Matches(BOUNDED_REFERENCE)
   @MaxLength(64)
   returnTarget: string;
+
+  @IsString()
+  @IsDefined()
+  @Matches(OPERATION_REFERENCE)
+  @MaxLength(128)
+  externalOperationRef: string;
 
   @IsString()
   @IsDefined()

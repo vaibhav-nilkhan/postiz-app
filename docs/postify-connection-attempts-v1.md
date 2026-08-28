@@ -13,11 +13,12 @@ All machine routes use a dedicated `Authorization` API-key middleware that
 rejects Postiz public OAuth bearer tokens. The API-key-derived organization is
 authoritative; no request field can select an organization.
 
-| Method | Route                                                  | Purpose                                                               |
-| ------ | ------------------------------------------------------ | --------------------------------------------------------------------- |
-| `POST` | `/public/v1/postify/connection-attempts`               | Create an expiring attempt and return its provider authorization URL. |
-| `GET`  | `/public/v1/postify/connection-attempts/:id`           | Poll a safe lifecycle projection.                                     |
-| `POST` | `/public/v1/postify/connection-attempts/:id/selection` | Finalize one provider-safe option for a two-step provider.            |
+| Method | Route                                                                     | Purpose                                                                   |
+| ------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `POST` | `/public/v1/postify/connection-attempts`                                  | Idempotently create an expiring attempt and return its authorization URL. |
+| `GET`  | `/public/v1/postify/connection-attempts/:id`                              | Poll a safe lifecycle projection; never recover an authorization URL.     |
+| `GET`  | `/public/v1/postify/connection-attempts/external-operation/:operationRef` | Recover a lost pending create response by Postify operation identity.     |
+| `POST` | `/public/v1/postify/connection-attempts/:id/selection`                    | Finalize one provider-safe option for a two-step provider.                |
 
 The create body is schema version 1:
 
@@ -27,10 +28,22 @@ The create body is schema version 1:
   "provider": "facebook",
   "purpose": "connect",
   "returnTarget": "postify",
+  "externalOperationRef": "postify-social-operation-reference",
   "externalWorkspaceRef": "postify-workspace-reference",
   "externalActorRef": "optional-postify-actor-reference"
 }
 ```
+
+`externalOperationRef` is a bounded opaque Postify operation identity, immutable
+and unique within the authenticated Postiz organization. Reusing it with the
+exact same customer/workspace/actor/provider/purpose/reconnect/return identity
+returns the same attempt. While that attempt is still pending, create and the
+external-operation recovery route return the exact original `authorizationUrl`
+without calling `generateAuthUrl` again. Identity reuse with any mismatch fails
+closed. Concurrent create requests reserve one database row; a request that
+arrives while its authorization URL is still being initialized waits briefly or
+returns an initializing conflict that is safe to retry by operation identity.
+An expired or consumed operation is never recycled into a new attempt.
 
 `purpose: "reauthorize"` also requires `reconnectIntegrationId`. That
 integration must be active and match the authenticated organization, exact
@@ -38,8 +51,9 @@ customer, and provider. Reauthorization preserves its Postiz integration ID and
 fails with `account_mismatch` if the provider result cannot prove the same
 provider account/page/channel.
 
-Create returns `schemaVersion: 1`, the safe poll projection, and
-`authorizationUrl`. Poll/finalize return only the finite status, bound attempt
+Create returns `schemaVersion: 1`, the safe poll projection, and (only while
+pending) `authorizationUrl`. The normal ID poll and finalize return only the
+finite status, bound attempt
 identity, expiry, safe failure code, provider-safe selection display metadata,
 truthful local lifecycle, and (only after success) `finalIntegrationId`.
 Two-step finalization accepts only the opaque `selectionId` previously returned
@@ -52,9 +66,11 @@ random (or, for OAuth 1 providers, the provider's high-entropy request token),
 necessarily present inside the provider `authorizationUrl` but never returned as
 a separate field or stored raw. It is stored as a SHA-256 hash, bound to
 attempt/organization/customer/provider/purpose by a correlation hash, consumed
-with a compare-and-set, and expires in 15 minutes. Encrypted transient
-authorization context uses AES-256-GCM and is cleared on terminal/interim
-completion.
+with a compare-and-set, and expires in 15 minutes. The original authorization
+URL is persisted only inside AES-256-GCM transient context so a lost create
+response is recoverable. State consumption atomically replaces that context with
+verifier-only ciphertext; uncertain exchange, terminal, and interim completion
+clear it. No poll exposes the URL after authorization begins.
 
 ## Server configuration and security assumptions
 
@@ -78,10 +94,21 @@ verifier, instance API keys, and custom credentials never appear in this API.
 Provider selection results are reduced to bounded display fields; query strings
 are removed from picture URLs. Interim and final writes transactionally recheck
 organization/customer/provider/attempt ownership, assign the exact Customer,
-and mark success. A durable `awaiting_selection` or `finalizing` attempt can be
-resumed after process interruption. An interruption during one-time provider
-code exchange remains truthfully `authenticating` until expiry; it is never
-guessed successful or retried with a consumed code.
+and mark success. Deferred PostgreSQL custody triggers independently reject a
+Customer or reconnect/interim/final Integration whose organization, customer,
+or provider differs from the immutable attempt, and reject later Customer or
+Integration identity changes that would break historical custody.
+
+A provider exception or unknown transaction acknowledgement after one-time code
+exchange remains truthfully `authenticating` until expiry; the consumed code is
+never replayed. If the transaction actually committed, the persisted success or
+selection state wins when reread. Explicit denial, malformed authenticated data,
+and wrong reconnect account are definitive failures. `finalizing` is similarly
+resumable: the exact same opaque selection may retry only the provider's
+read-only `fetchPageInformation` boundary and local serializable transaction.
+Provider-read or unknown commit outcomes remain `finalizing`; malformed or
+mismatched selection data fails definitively. A different selection cannot be
+substituted.
 
 Lifecycle is local Postiz fact only: `disabled`, `setupIncomplete`,
 `refreshNeeded`, known `tokenExpiresAt`, and `softDeleted`. This contract does
@@ -92,9 +119,13 @@ Postify approval, or provider credential custody outside Postiz.
 
 Apply
 `libraries/nestjs-libraries/src/database/prisma/migrations/20260828000000_postify_connection_attempts/migration.sql`
-before serving the routes, then run Prisma generation. The migration is additive:
-three enums, one table, indexes/FKs/checks, and transition/delete guards; it
-does not rewrite existing integration or publication rows.
+and then
+`libraries/nestjs-libraries/src/database/prisma/migrations/20260828010000_connection_attempt_idempotency_and_custody/migration.sql`
+before serving the routes, then run Prisma generation. The migrations add the
+aggregate, operation reservation/recovery identity, indexes/FKs/checks,
+transition/delete guards, and deferred custody triggers. The second migration
+backfills any pre-correction attempt with a non-reusable `legacy:<attempt UUID>`
+operation identity; it does not rewrite Integration or publication rows.
 
 This is modified AGPL-3.0 Postiz source. Operators who provide network access to
 the modified service must provide the corresponding source under the repository
@@ -108,6 +139,12 @@ pnpm exec prisma validate --schema libraries/nestjs-libraries/src/database/prism
 pnpm exec vitest run --config vitest.connection-attempt.config.ts
 pnpm run build:backend
 ```
+
+The direct trigger tests require an isolated disposable PostgreSQL database and
+are enabled with `POSTIZ_CONNECTION_ATTEMPT_POSTGRES_TEST=1` plus standard `PG*`
+connection variables. They apply both migrations to minimal prerequisite tables,
+commit valid direct/reauthorization/two-step transitions, and prove that direct
+SQL cross-organization/customer/provider substitution is rejected.
 
 For every upstream rebase/upgrade, rerun those checks plus existing publication-
 attempt tests and manually re-audit provider `generateAuthUrl`, `authenticate`,

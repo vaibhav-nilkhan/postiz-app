@@ -29,6 +29,17 @@ export class PostifyConnectionAttemptsController {
     return this._attempts.read(organization.id, id);
   }
 
+  @Get('/external-operation/:externalOperationRef')
+  readByExternalOperation(
+    @GetOrgFromRequest() organization: Organization,
+    @Param('externalOperationRef') externalOperationRef: string
+  ) {
+    return this._attempts.readByExternalOperation(
+      organization.id,
+      externalOperationRef
+    );
+  }
+
   @Post('/:id/selection')
   select(
     @GetOrgFromRequest() organization: Organization,

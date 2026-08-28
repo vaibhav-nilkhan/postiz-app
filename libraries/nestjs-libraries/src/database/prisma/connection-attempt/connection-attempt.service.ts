@@ -31,7 +31,14 @@ type SelectableProvider = SocialProvider & {
   companies?: (accessToken: string) => Promise<unknown[]>;
 };
 
+type AuthorizationContext = {
+  codeVerifier: string;
+  authorizationUrl?: string;
+};
+
 const CALLBACK_TTL_MS = 15 * 60 * 1000;
+const INITIALIZATION_WAIT_ATTEMPTS = 100;
+const OPERATION_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
 const TERMINAL_STATUSES = new Set<ConnectionAttemptStatus>([
   ConnectionAttemptStatus.SUCCEEDED,
   ConnectionAttemptStatus.FAILED,
@@ -96,7 +103,7 @@ export class ConnectionAttemptService {
     return crypto.createHash('sha256').update(secret).digest();
   }
 
-  private encryptAuthorizationContext(codeVerifier: string): string {
+  private encryptAuthorizationContext(context: AuthorizationContext): string {
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv(
       'aes-256-gcm',
@@ -104,20 +111,24 @@ export class ConnectionAttemptService {
       iv
     );
     const encrypted = Buffer.concat([
-      cipher.update(JSON.stringify({ codeVerifier }), 'utf8'),
+      cipher.update(JSON.stringify(context), 'utf8'),
       cipher.final(),
     ]);
-    return [
+    const value = [
       'v1',
       iv.toString('base64url'),
       cipher.getAuthTag().toString('base64url'),
       encrypted.toString('base64url'),
     ].join('.');
+    if (value.length > 8192) {
+      throw new BadRequestException('Provider authorization URL is too long');
+    }
+    return value;
   }
 
-  private decryptAuthorizationContext(value: string | null): {
-    codeVerifier: string;
-  } {
+  private decryptAuthorizationContext(
+    value: string | null
+  ): AuthorizationContext {
     try {
       const [version, iv, tag, encrypted] = (value || '').split('.');
       if (version !== 'v1' || !iv || !tag || !encrypted) {
@@ -138,9 +149,26 @@ export class ConnectionAttemptService {
       if (typeof parsed.codeVerifier !== 'string') {
         throw new Error('invalid context');
       }
-      return { codeVerifier: parsed.codeVerifier };
+      if (
+        parsed.authorizationUrl !== undefined &&
+        typeof parsed.authorizationUrl !== 'string'
+      ) {
+        throw new Error('invalid context');
+      }
+      return {
+        codeVerifier: parsed.codeVerifier,
+        ...(parsed.authorizationUrl
+          ? { authorizationUrl: parsed.authorizationUrl }
+          : {}),
+      };
     } catch {
       throw new ConflictException('Connection attempt context is invalid');
+    }
+  }
+
+  private assertOperationReference(externalOperationRef: string) {
+    if (!OPERATION_REFERENCE.test(externalOperationRef)) {
+      throw new BadRequestException('External operation reference is invalid');
     }
   }
 
@@ -258,10 +286,122 @@ export class ConnectionAttemptService {
         'Provider does not expose a safe OAuth state contract'
       );
     }
-    return { authorizationUrl: authorizationUrl.toString(), state };
+    const serialized = authorizationUrl.toString();
+    if (serialized.length > 4096) {
+      throw new BadRequestException('Provider authorization URL is too long');
+    }
+    return { authorizationUrl: serialized, state };
+  }
+
+  private operationIdentityMatches(
+    attempt: ConnectionAttemptWithIntegrations,
+    input: CreateConnectionAttemptDto,
+    purpose: ConnectionAttemptPurpose
+  ) {
+    return (
+      attempt.customerId === input.customerId &&
+      attempt.externalWorkspaceRef === input.externalWorkspaceRef &&
+      attempt.externalActorRef === (input.externalActorRef || null) &&
+      attempt.provider === input.provider &&
+      attempt.purpose === purpose &&
+      attempt.reconnectIntegrationId ===
+        (input.reconnectIntegrationId || null) &&
+      attempt.returnTarget === input.returnTarget
+    );
+  }
+
+  private operationResponse(attempt: ConnectionAttemptWithIntegrations) {
+    const projection = this.project(attempt);
+    if (
+      attempt.status !== ConnectionAttemptStatus.PENDING ||
+      !attempt.stateHash ||
+      !attempt.authorizationContext
+    ) {
+      return projection;
+    }
+    const { authorizationUrl } = this.decryptAuthorizationContext(
+      attempt.authorizationContext
+    );
+    return authorizationUrl ? { ...projection, authorizationUrl } : projection;
+  }
+
+  private async waitForInitialization(
+    organizationId: string,
+    externalOperationRef: string,
+    initial: ConnectionAttemptWithIntegrations
+  ) {
+    let attempt = initial;
+    for (
+      let count = 0;
+      count < INITIALIZATION_WAIT_ATTEMPTS &&
+      attempt.status === ConnectionAttemptStatus.PENDING &&
+      !attempt.stateHash;
+      count++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      attempt = (await this._repository.findByExternalOperation(
+        organizationId,
+        externalOperationRef
+      ))!;
+      if (!attempt) {
+        throw new NotFoundException('Connection attempt not found');
+      }
+    }
+    if (
+      attempt.status === ConnectionAttemptStatus.PENDING &&
+      !attempt.stateHash
+    ) {
+      throw new ConflictException(
+        'Connection attempt authorization is initializing'
+      );
+    }
+    return attempt;
+  }
+
+  private async recoverOperation(
+    organizationId: string,
+    externalOperationRef: string,
+    initial: ConnectionAttemptWithIntegrations
+  ) {
+    let attempt = initial;
+    if (attempt.expiresAt <= new Date()) {
+      await this._repository.expire(attempt.id, organizationId);
+      attempt = (await this._repository.findByExternalOperation(
+        organizationId,
+        externalOperationRef
+      ))!;
+    }
+    attempt = await this.waitForInitialization(
+      organizationId,
+      externalOperationRef,
+      attempt
+    );
+    return this.operationResponse(attempt);
   }
 
   async create(organization: Organization, input: CreateConnectionAttemptDto) {
+    this.assertOperationReference(input.externalOperationRef);
+    const purpose =
+      input.purpose === 'connect'
+        ? ConnectionAttemptPurpose.CONNECT
+        : ConnectionAttemptPurpose.REAUTHORIZE;
+    const existing = await this._repository.findByExternalOperation(
+      organization.id,
+      input.externalOperationRef
+    );
+    if (existing) {
+      if (!this.operationIdentityMatches(existing, input, purpose)) {
+        throw new ConflictException(
+          'External operation reference identity conflict'
+        );
+      }
+      return this.recoverOperation(
+        organization.id,
+        input.externalOperationRef,
+        existing
+      );
+    }
+
     const returnUrl = this.configuredReturnUrl(input.returnTarget);
     void returnUrl;
     const provider = this.provider(input.provider);
@@ -302,34 +442,58 @@ export class ConnectionAttemptService {
       );
     }
 
+    const reservation = await this._repository.reserve({
+      id: crypto.randomUUID(),
+      organizationId: organization.id,
+      customerId: input.customerId,
+      externalOperationRef: input.externalOperationRef,
+      externalWorkspaceRef: input.externalWorkspaceRef,
+      externalActorRef: input.externalActorRef,
+      provider: input.provider,
+      purpose,
+      reconnectIntegrationId: reconnect?.id,
+      returnTarget: input.returnTarget,
+      expiresAt: new Date(Date.now() + CALLBACK_TTL_MS),
+    });
+    if (!this.operationIdentityMatches(reservation.attempt, input, purpose)) {
+      throw new ConflictException(
+        'External operation reference identity conflict'
+      );
+    }
+    if (!reservation.created) {
+      return this.recoverOperation(
+        organization.id,
+        input.externalOperationRef,
+        reservation.attempt
+      );
+    }
+
     const generated = await provider.generateAuthUrl();
     const bound = this.bindState(generated);
-    const id = crypto.randomUUID();
     const stateHash = sha256(bound.state);
-    const purpose =
-      input.purpose === 'connect'
-        ? ConnectionAttemptPurpose.CONNECT
-        : ConnectionAttemptPurpose.REAUTHORIZE;
     const identity = {
-      id,
+      id: reservation.attempt.id,
       organizationId: organization.id,
       customerId: input.customerId,
       provider: input.provider,
       purpose,
       stateHash,
     };
-    const attempt = await this._repository.create({
-      ...identity,
-      externalWorkspaceRef: input.externalWorkspaceRef,
-      externalActorRef: input.externalActorRef,
-      reconnectIntegrationId: reconnect?.id,
-      returnTarget: input.returnTarget,
-      stateCorrelation: this.correlation(identity),
-      authorizationContext: this.encryptAuthorizationContext(
-        generated.codeVerifier
-      ),
-      expiresAt: new Date(Date.now() + CALLBACK_TTL_MS),
-    });
+    const attempt = await this._repository.activate(
+      reservation.attempt.id,
+      stateHash,
+      this.correlation(identity),
+      this.encryptAuthorizationContext({
+        codeVerifier: generated.codeVerifier,
+        authorizationUrl: bound.authorizationUrl,
+      })
+    );
+    if (!attempt) {
+      return this.readByExternalOperation(
+        organization.id,
+        input.externalOperationRef
+      );
+    }
     return {
       ...this.project(attempt),
       authorizationUrl: bound.authorizationUrl,
@@ -343,6 +507,21 @@ export class ConnectionAttemptService {
       throw new NotFoundException('Connection attempt not found');
     }
     return this.project(attempt);
+  }
+
+  async readByExternalOperation(
+    organizationId: string,
+    externalOperationRef: string
+  ) {
+    this.assertOperationReference(externalOperationRef);
+    let attempt = await this._repository.findByExternalOperation(
+      organizationId,
+      externalOperationRef
+    );
+    if (!attempt) {
+      throw new NotFoundException('Connection attempt not found');
+    }
+    return this.recoverOperation(organizationId, externalOperationRef, attempt);
   }
 
   private selectionOptions(
@@ -425,6 +604,30 @@ export class ConnectionAttemptService {
       .catch(() => undefined);
   }
 
+  private async failedCallback(
+    attempt: ConnectionAttemptWithIntegrations,
+    failureCode: ConnectionAttemptFailureCode,
+    allowedStatuses: ConnectionAttemptStatus[]
+  ) {
+    await this._repository.fail(attempt.id, failureCode, allowedStatuses);
+    const failed = (await this._repository.getOwned(
+      attempt.organizationId,
+      attempt.id
+    ))!;
+    return this.callbackResponse(failed);
+  }
+
+  private async uncertainAuthentication(
+    attempt: ConnectionAttemptWithIntegrations
+  ) {
+    await this._repository.clearAuthorizationContext(attempt.id);
+    const current = (await this._repository.getOwned(
+      attempt.organizationId,
+      attempt.id
+    ))!;
+    return this.callbackResponse(current);
+  }
+
   async tryHandleCallback(
     callbackProvider: string,
     body: ConnectIntegrationDto
@@ -437,29 +640,24 @@ export class ConnectionAttemptService {
     if (!attempt) {
       return null;
     }
-    if (attempt.stateCorrelation !== this.correlation(attempt)) {
-      await this._repository.fail(
-        attempt.id,
+    if (
+      !attempt.stateHash ||
+      !attempt.stateCorrelation ||
+      attempt.stateCorrelation !==
+        this.correlation({ ...attempt, stateHash: attempt.stateHash })
+    ) {
+      return this.failedCallback(
+        attempt,
         ConnectionAttemptFailureCode.INVALID_STATE,
         [ConnectionAttemptStatus.PENDING]
       );
-      attempt = (await this._repository.getOwned(
-        attempt.organizationId,
-        attempt.id
-      ))!;
-      return this.callbackResponse(attempt);
     }
     if (attempt.provider !== callbackProvider) {
-      await this._repository.fail(
-        attempt.id,
+      return this.failedCallback(
+        attempt,
         ConnectionAttemptFailureCode.PROVIDER_MISMATCH,
         [ConnectionAttemptStatus.PENDING]
       );
-      attempt = (await this._repository.getOwned(
-        attempt.organizationId,
-        attempt.id
-      ))!;
-      return this.callbackResponse(attempt);
     }
     if (attempt.expiresAt <= new Date()) {
       await this._repository.expire(attempt.id);
@@ -473,53 +671,88 @@ export class ConnectionAttemptService {
       throw new ConflictException('Connection attempt state was already used');
     }
 
-    const claimed = await this._repository.claimState(attempt.id, new Date());
-    if (!claimed) {
-      throw new ConflictException('Connection attempt state was already used');
-    }
     if (body.error || !body.code) {
-      await this._repository.fail(
-        claimed.id,
+      const claimed = await this._repository.claimState(
+        attempt.id,
+        new Date(),
+        null
+      );
+      if (!claimed) {
+        throw new ConflictException(
+          'Connection attempt state was already used'
+        );
+      }
+      return this.failedCallback(
+        claimed,
         body.error
           ? ConnectionAttemptFailureCode.ACCESS_DENIED
           : ConnectionAttemptFailureCode.AUTHENTICATION_FAILED,
         [ConnectionAttemptStatus.AUTHENTICATING]
       );
-      const failed = (await this._repository.getOwned(
-        claimed.organizationId,
-        claimed.id
-      ))!;
-      return this.callbackResponse(failed);
     }
 
-    const provider = this.provider(claimed.provider);
-    let callbackFailureCode: ConnectionAttemptFailureCode =
-      ConnectionAttemptFailureCode.AUTHENTICATION_FAILED;
+    let codeVerifier: string;
     try {
-      const { codeVerifier } = this.decryptAuthorizationContext(
-        claimed.authorizationContext
+      codeVerifier = this.decryptAuthorizationContext(
+        attempt.authorizationContext
+      ).codeVerifier;
+    } catch {
+      return this.failedCallback(
+        attempt,
+        ConnectionAttemptFailureCode.INVALID_STATE,
+        [ConnectionAttemptStatus.PENDING]
       );
-      const authenticated = await provider.authenticate({
+    }
+    const claimed = await this._repository.claimState(
+      attempt.id,
+      new Date(),
+      this.encryptAuthorizationContext({ codeVerifier })
+    );
+    if (!claimed) {
+      throw new ConflictException('Connection attempt state was already used');
+    }
+
+    let provider: SelectableProvider;
+    try {
+      provider = this.provider(claimed.provider);
+    } catch {
+      return this.uncertainAuthentication(claimed);
+    }
+
+    let authenticated: AuthTokenDetails | string;
+    try {
+      authenticated = await provider.authenticate({
         code: body.code,
         codeVerifier,
       });
-      if (
-        typeof authenticated === 'string' ||
-        authenticated.error ||
-        !authenticated.id ||
-        !authenticated.accessToken
-      ) {
-        throw new Error('authentication failed');
-      }
+    } catch {
+      return this.uncertainAuthentication(claimed);
+    }
+    if (
+      typeof authenticated === 'string' ||
+      authenticated.error ||
+      !authenticated.id ||
+      !authenticated.accessToken
+    ) {
+      return this.failedCallback(
+        claimed,
+        ConnectionAttemptFailureCode.AUTHENTICATION_FAILED,
+        [ConnectionAttemptStatus.AUTHENTICATING]
+      );
+    }
 
-      let details: AuthTokenDetails = authenticated;
-      if (claimed.purpose === ConnectionAttemptPurpose.REAUTHORIZE) {
-        callbackFailureCode = ConnectionAttemptFailureCode.ACCOUNT_MISMATCH;
-        const expected = claimed.reconnectIntegration;
-        if (!expected) {
-          throw new Error('account mismatch');
-        }
-        if (provider.reConnect) {
+    let details: AuthTokenDetails = authenticated;
+    if (claimed.purpose === ConnectionAttemptPurpose.REAUTHORIZE) {
+      const expected = claimed.reconnectIntegration;
+      if (!expected) {
+        return this.failedCallback(
+          claimed,
+          ConnectionAttemptFailureCode.ACCOUNT_MISMATCH,
+          [ConnectionAttemptStatus.AUTHENTICATING]
+        );
+      }
+      if (provider.reConnect) {
+        try {
           const reconnected = await provider.reConnect(
             authenticated.id,
             expected.internalId,
@@ -531,28 +764,26 @@ export class ConnectionAttemptService {
             refreshToken: authenticated.refreshToken,
             expiresIn: authenticated.expiresIn,
           };
+        } catch {
+          return this.uncertainAuthentication(claimed);
         }
-        if (String(details.id) !== String(expected.internalId)) {
-          await this._repository.fail(
-            claimed.id,
-            ConnectionAttemptFailureCode.ACCOUNT_MISMATCH,
-            [ConnectionAttemptStatus.AUTHENTICATING]
-          );
-          const failed = (await this._repository.getOwned(
-            claimed.organizationId,
-            claimed.id
-          ))!;
-          return this.callbackResponse(failed);
-        }
-        callbackFailureCode =
-          ConnectionAttemptFailureCode.AUTHENTICATION_FAILED;
       }
+      if (String(details.id) !== String(expected.internalId)) {
+        return this.failedCallback(
+          claimed,
+          ConnectionAttemptFailureCode.ACCOUNT_MISMATCH,
+          [ConnectionAttemptStatus.AUTHENTICATING]
+        );
+      }
+    }
 
-      const name =
-        boundedString(details.name, 200) ||
-        boundedString(details.username, 200) ||
-        `Channel_${String(details.id).slice(0, 8)}`;
-      const selectionOptions =
+    const name =
+      boundedString(details.name, 200) ||
+      boundedString(details.username, 200) ||
+      `Channel_${String(details.id).slice(0, 8)}`;
+    let selectionOptions: SafeSelectionOption[] | undefined;
+    try {
+      selectionOptions =
         provider.isBetweenSteps &&
         claimed.purpose === ConnectionAttemptPurpose.CONNECT
           ? await this.providerSelections(
@@ -561,6 +792,10 @@ export class ConnectionAttemptService {
               claimed.id
             )
           : undefined;
+    } catch {
+      return this.uncertainAuthentication(claimed);
+    }
+    try {
       const completed = await this._repository.completeAuthentication({
         attemptId: claimed.id,
         details: { ...details, id: String(details.id), name: name.trim() },
@@ -570,14 +805,7 @@ export class ConnectionAttemptService {
       await this.refreshWorkflow(completed, provider);
       return this.callbackResponse(completed);
     } catch {
-      await this._repository.fail(claimed.id, callbackFailureCode, [
-        ConnectionAttemptStatus.AUTHENTICATING,
-      ]);
-      const failed = (await this._repository.getOwned(
-        claimed.organizationId,
-        claimed.id
-      ))!;
-      return this.callbackResponse(failed);
+      return this.uncertainAuthentication(claimed);
     }
   }
 
@@ -603,23 +831,58 @@ export class ConnectionAttemptService {
       await this._repository.expire(id, organizationId);
       return this.read(organizationId, id);
     }
+    if (claimed.completed) {
+      return this.project(claimed.attempt);
+    }
 
-    const provider = this.provider(claimed.attempt.provider);
+    let provider: SelectableProvider;
     try {
-      const information = await provider.fetchPageInformation!(
+      provider = this.provider(claimed.attempt.provider);
+    } catch {
+      return this.read(organizationId, id);
+    }
+    let information;
+    try {
+      information = await provider.fetchPageInformation!(
         claimed.attempt.interimIntegration!.token,
         claimed.option.payload
       );
+    } catch {
+      return this.read(organizationId, id);
+    }
+    const informationId = boundedString(information?.id, 512);
+    const accessToken =
+      typeof information?.access_token === 'string' &&
+      information.access_token.length > 0
+        ? information.access_token
+        : undefined;
+    const expectedId =
+      claimed.option.payload.page ||
+      claimed.option.payload.id ||
+      claimed.option.payload.pageId;
+    if (
+      !informationId ||
+      !accessToken ||
+      String(informationId) !== String(expectedId)
+    ) {
+      await this._repository.fail(
+        id,
+        ConnectionAttemptFailureCode.SELECTION_FAILED,
+        [ConnectionAttemptStatus.FINALIZING]
+      );
+      return this.read(organizationId, id);
+    }
+    try {
       const completed = await this._repository.completeSelection({
         organizationId,
         attemptId: id,
         selectionId,
         information: {
-          id: String(information.id),
+          id: informationId,
           name:
             boundedString(information.name, 200) ||
-            `Channel_${String(information.id).slice(0, 8)}`,
-          access_token: information.access_token,
+            `Channel_${informationId.slice(0, 8)}`,
+          access_token: accessToken,
           picture: safePicture(information.picture),
           username: boundedString(information.username, 200),
         },
@@ -627,11 +890,6 @@ export class ConnectionAttemptService {
       await this.refreshWorkflow(completed, provider);
       return this.project(completed);
     } catch {
-      await this._repository.fail(
-        id,
-        ConnectionAttemptFailureCode.SELECTION_FAILED,
-        [ConnectionAttemptStatus.FINALIZING]
-      );
       return this.read(organizationId, id);
     }
   }
@@ -648,6 +906,7 @@ export class ConnectionAttemptService {
       provider: attempt.provider,
       purpose: attempt.purpose.toLowerCase(),
       customerId: attempt.customerId,
+      externalOperationRef: attempt.externalOperationRef,
       externalWorkspaceRef: attempt.externalWorkspaceRef,
       ...(attempt.externalActorRef
         ? { externalActorRef: attempt.externalActorRef }

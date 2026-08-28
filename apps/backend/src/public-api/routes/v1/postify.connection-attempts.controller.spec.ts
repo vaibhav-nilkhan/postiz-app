@@ -9,6 +9,7 @@ describe('PostifyConnectionAttemptsController contract', () => {
     const attempts = {
       create: vi.fn(async (...args: unknown[]) => args),
       read: vi.fn(async (...args: unknown[]) => args),
+      readByExternalOperation: vi.fn(async (...args: unknown[]) => args),
       finalizeSelection: vi.fn(async (...args: unknown[]) => args),
     };
     const controller = new PostifyConnectionAttemptsController(
@@ -21,11 +22,13 @@ describe('PostifyConnectionAttemptsController contract', () => {
       provider: 'direct',
       purpose: 'connect',
       returnTarget: 'postify',
+      externalOperationRef: 'operation-1',
       externalWorkspaceRef: 'workspace-1',
     } as never;
 
     await controller.create(organization, body);
     await controller.read(organization, 'attempt-1');
+    await controller.readByExternalOperation(organization, 'operation-1');
     await controller.select(organization, 'attempt-1', {
       selectionId: 'a'.repeat(32),
     });
@@ -34,6 +37,10 @@ describe('PostifyConnectionAttemptsController contract', () => {
     expect(attempts.read).toHaveBeenCalledWith(
       'authenticated-org',
       'attempt-1'
+    );
+    expect(attempts.readByExternalOperation).toHaveBeenCalledWith(
+      'authenticated-org',
+      'operation-1'
     );
     expect(attempts.finalizeSelection).toHaveBeenCalledWith(
       'authenticated-org',
