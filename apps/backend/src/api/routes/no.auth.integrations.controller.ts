@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -24,6 +25,7 @@ import {
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
+import { ConnectionAttemptService } from '@gitroom/nestjs-libraries/database/prisma/connection-attempt/connection-attempt.service';
 
 @ApiTags('Integrations')
 @Controller('/integrations')
@@ -32,7 +34,8 @@ export class NoAuthIntegrationsController {
     private _integrationManager: IntegrationManager,
     private _integrationService: IntegrationService,
     private _refreshIntegrationService: RefreshIntegrationService,
-    private _organizationService: OrganizationService
+    private _organizationService: OrganizationService,
+    private _connectionAttemptService: ConnectionAttemptService
   ) {}
 
   @Get('/')
@@ -53,6 +56,15 @@ export class NoAuthIntegrationsController {
         .includes(integration)
     ) {
       throw new Error('Integration not allowed');
+    }
+
+    const connectionAttempt =
+      await this._connectionAttemptService.tryHandleCallback(integration, body);
+    if (connectionAttempt) {
+      return connectionAttempt;
+    }
+    if (!body.code) {
+      throw new BadRequestException('Invalid authorization response');
     }
 
     const integrationProvider =
